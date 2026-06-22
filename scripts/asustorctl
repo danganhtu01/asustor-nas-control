@@ -38,7 +38,7 @@ as_root() {
   if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
     "$@"
   else
-    exec sudo -- "$@"
+    sudo -- "$@"
   fi
 }
 
@@ -197,7 +197,10 @@ cmd_pwm_mode() {
   local h
   h=$(hwmon_dir)
   [[ -e "$h/pwm${channel}_enable" ]] || die "missing PWM enable for channel: pwm$channel"
-  sys_write "$(mode_value "$mode")" "$h/pwm${channel}_enable"
+  local parsed
+  parsed=$(mode_value "$mode")
+  sys_write "$parsed" "$h/pwm${channel}_enable"
+  printf 'pwm%s_enable=%s\n' "$channel" "$parsed"
 }
 
 cmd_led() {
@@ -225,12 +228,14 @@ cmd_led() {
         *) die "LED value must be on, off, 1, or 0" ;;
       esac
       sys_write "$value" "$(led_path "$name")/brightness"
+      printf '%s brightness=%s\n' "$name" "$value"
       ;;
     trigger)
       local name=${1:-}
       local trigger=${2:-}
       [[ -n "$name" && -n "$trigger" ]] || die "usage: asustorctl led trigger <led-name> <trigger>"
       sys_write "$trigger" "$(led_path "$name")/trigger"
+      printf '%s trigger=%s\n' "$name" "$trigger"
       ;;
     *)
       usage
@@ -257,6 +262,7 @@ cmd_blink() {
       [[ "$slot" =~ ^[0-9]+$ && -n "$value" ]] || die "usage: asustorctl blink set <slot> <gpio-number|0>"
       [[ -e "$h/gpled${slot}_blink" ]] || die "missing blink slot: gpled${slot}_blink"
       sys_write "$value" "$h/gpled${slot}_blink"
+      printf 'gpled%s_blink=%s\n' "$slot" "$value"
       ;;
     freq)
       slot=${1:-}
@@ -264,6 +270,7 @@ cmd_blink() {
       [[ "$slot" =~ ^[0-9]+$ && "$value" =~ ^[0-9]+$ ]] || die "usage: asustorctl blink freq <slot> <mode>"
       [[ -e "$h/gpled${slot}_blink_freq" ]] || die "missing blink frequency slot: gpled${slot}_blink_freq"
       sys_write "$value" "$h/gpled${slot}_blink_freq"
+      printf 'gpled%s_blink_freq=%s\n' "$slot" "$value"
       ;;
     *)
       usage
@@ -301,4 +308,3 @@ main() {
 }
 
 main "$@"
-

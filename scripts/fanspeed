@@ -7,5 +7,9 @@ if [[ $# -ne 1 ]]; then
   exit 2
 fi
 
-exec asustorctl fan speed "$1"
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+if [[ -x "$script_dir/asustorctl" ]]; then
+  exec "$script_dir/asustorctl" fan speed "$1"
+fi
 
+exec asustorctl fan speed "$1"
