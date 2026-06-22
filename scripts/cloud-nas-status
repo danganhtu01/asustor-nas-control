@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /home/atdang/.local/bin/cloud-nas-lib
+load_cloud_nas_config
+
+section() {
+  printf '\n== %s ==\n' "$1"
+}
+
+latest_stats() {
+  local log=$1
+  [[ -r "$log" ]] || return 0
+  awk '
+    /Transferred:/ || /Errors:/ || /Checks:/ || /Elapsed time:/ || /ETA/ {
+      lines[++count] = $0
+      if (count > 12) {
+        for (i = 1; i < count; i++) lines[i] = lines[i + 1]
+        count = 12
+      }
+    }
+    END {
+      for (i = 1; i <= count; i++) print lines[i]
+    }
+  ' "$log"
+}
+
+section "User Timers"
+systemctl --user list-timers 'cloud-nas*' --all --no-pager || true
+
+section "Services"
+systemctl --user --no-pager --plain status cloud-nas-sync.service cloud-nas-backup.service 2>/dev/null || true
+
+section "Running Rclone"
+pgrep -a -u "$(id -u)" -f 'rclone sync|cloud-nas' || true
+
+section "NAS Space"
+df -h "$NAS03_MOUNT" "$NAS02_MOUNT" 2>/dev/null || true
+
+section "Remotes"
+rclone listremotes || true
+
+section "Latest Sync Stats"
+while IFS= read -r remote; do
+  [[ -n "$remote" ]] || continue
+  safe=$(safe_remote_name "$remote")
+  log="$CLOUD_NAS_STATE_DIR/rclone-sync-${safe}.log"
+  printf '\n-- %s --\n' "$remote"
+  if [[ -r "$log" ]]; then
+    latest_stats "$log"
+    grep -E 'ERROR|CRITICAL|Failed to sync' "$log" | tail -n 5 || true
+  else
+    printf 'no log yet: %s\n' "$log"
+  fi
+done < <(configured_remotes)
+
+section "Latest Backups"
+find "$NAS02_BACKUP_ROOT" -maxdepth 1 -type d -name '*Backup*' -printf '%TY-%Tm-%Td %TH:%TM %f\n' 2>/dev/null | sort | tail -n 10 || true

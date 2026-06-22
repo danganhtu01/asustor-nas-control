@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+
+if ! systemctl --user --quiet is-active default.target; then
+  echo "user systemd manager is not reachable"
+  echo "try: loginctl enable-linger $(id -un)"
+  exit 1
+fi
+
+echo "stopping any active cloud-nas sync..."
+systemctl --user stop cloud-nas-sync.service || true
+systemctl --user reset-failed cloud-nas-sync.service || true
+
+echo "configured rclone remotes:"
+rclone listremotes
+
+echo "starting all-remotes sync now..."
+systemctl --user start --no-block cloud-nas-sync.service
+
+echo
+echo "monitor with:"
+echo "  cloud-nas-status"
+echo "  systemctl --user status cloud-nas-sync.service --no-pager"
+echo "  tail -f /home/atdang/.local/state/cloud-nas/sync.log"
