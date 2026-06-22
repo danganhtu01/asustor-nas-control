@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROGRAM=${0##*/}
+DEFAULT_PWM=${ASUSTOR_FAN_PWM:-1}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  asustorctl status
+  asustorctl fan status
+  asustorctl fan speed <0-255|percent%>
+  asustorctl fan mode <manual|auto>
+  asustorctl pwm list
+  asustorctl pwm set <channel> <0-255|percent%>
+  asustorctl pwm mode <channel> <manual|auto>
+  asustorctl led list
+  asustorctl led set <led-name> <on|off|0|1>
+  asustorctl led trigger <led-name> <trigger>
+  asustorctl blink status
+  asustorctl blink set <slot> <gpio-number|0>
+  asustorctl blink freq <slot> <mode>
+
+Examples:
+  fanspeed 200
+  fanspeed 70%
+  asustorctl led set green:status on
+  asustorctl led trigger green:usb usb-host
+USAGE
+}
+
+as_root() {
+  if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+    "$@"
+  else
+    exec sudo -- "$@"
+  fi
+}
+
+sys_write() {
+  local value=$1
+  local path=$2
+  [[ -e "$path" ]] || die "missing sysfs file: $path"
+
+  if [[ -w "$path" && ${EUID:-$(id -u)} -eq 0 ]]; then
+    printf '%s\n' "$value" >"$path"
+  else
+    as_root /bin/sh -c 'printf "%s\n" "$1" > "$2"' sh "$value" "$path"
+  fi
+}
+
+hwmon_dir() {
+  local h name
+  for h in /sys/devices/platform/asustor_it87.*/hwmon/hwmon* /sys/class/hwmon/hwmon*; do
+    [[ -d "$h" ]] || continue
+    name=$(cat "$h/name" 2>/dev/null || true)
+    case "$name" in
+      it8625|it87|asustor_it87|asustor-it87)
+        printf '%s\n' "$h"
+        return 0
+        ;;
+    esac
+  done
+  die "could not find asustor_it87 hwmon directory"
+}
+
+parse_pwm_value() {
+  local input=$1
+  local number
+  if [[ "$input" =~ ^([0-9]+)%$ ]]; then
+    number=${BASH_REMATCH[1]}
+    (( number <= 100 )) || die "percent must be between 0 and 100"
+    printf '%d\n' $(( (number * 255 + 50) / 100 ))
+    return
+  fi
+  [[ "$input" =~ ^[0-9]+$ ]] || die "PWM value must be 0-255 or percent like 70%"
+  (( input >= 0 && input <= 255 )) || die "PWM value must be between 0 and 255"
+  printf '%s\n' "$input"
+}
+
+mode_value() {
+  case "$1" in
+    manual|1) printf '1\n' ;;
+    auto|automatic|2) printf '2\n' ;;
+    *) die "mode must be manual or auto" ;;
+  esac
+}
+
+led_path() {
+  local name=$1
+  local path="/sys/class/leds/$name"
+  [[ -d "$path" ]] || die "LED not found: $name"
+  printf '%s\n' "$path"
+}
+
+is_asustor_led() {
+  case "$1" in
+    blue:lan|blue:power|green:status|green:usb|power:front_panel|power:lcd|red:power|red:status|sata*:green:disk|sata*:red:disk)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+cmd_status() {
+  local h
+  h=$(hwmon_dir)
+  printf 'hwmon: %s\n' "$h"
+  printf 'chip:  %s\n' "$(cat "$h/name" 2>/dev/null || printf unknown)"
+  printf '\nFans:\n'
+  for f in "$h"/fan*_input; do
+    [[ -e "$f" ]] || continue
+    printf '  %-10s %s RPM\n' "$(basename "$f" _input)" "$(cat "$f")"
+  done
+  printf '\nPWM:\n'
+  for p in "$h"/pwm[0-9]; do
+    [[ -e "$p" ]] || continue
+    local n enable
+    n=${p##*/pwm}
+    enable=unknown
+    [[ -e "$h/pwm${n}_enable" ]] && enable=$(cat "$h/pwm${n}_enable")
+    printf '  pwm%-7s value=%-4s enable=%s\n' "$n" "$(cat "$p")" "$enable"
+  done
+  printf '\nTemperatures:\n'
+  for t in "$h"/temp*_input /sys/class/hwmon/hwmon*/temp*_input; do
+    [[ -e "$t" ]] || continue
+    local raw label base
+    raw=$(cat "$t" 2>/dev/null || true)
+    [[ "$raw" =~ ^-?[0-9]+$ ]] || continue
+    base=${t%_input}
+    label=$(cat "${base}_label" 2>/dev/null || basename "$base")
+    printf '  %-24s %s.%03d C\n' "$label" "$(( raw / 1000 ))" "$(( raw < 0 ? -raw % 1000 : raw % 1000 ))"
+  done
+  printf '\nASUSTOR LEDs:\n'
+  cmd_led list
+}
+
+cmd_fan_status() {
+  local h
+  h=$(hwmon_dir)
+  for f in "$h"/fan*_input; do
+    [[ -e "$f" ]] || continue
+    printf '%s=%s RPM\n' "$(basename "$f" _input)" "$(cat "$f")"
+  done
+  for p in "$h"/pwm[0-9]; do
+    [[ -e "$p" ]] || continue
+    local n enable
+    n=${p##*/pwm}
+    enable=unknown
+    [[ -e "$h/pwm${n}_enable" ]] && enable=$(cat "$h/pwm${n}_enable")
+    printf 'pwm%s=%s enable=%s\n' "$n" "$(cat "$p")" "$enable"
+  done
+}
+
+cmd_pwm_list() {
+  local h
+  h=$(hwmon_dir)
+  for p in "$h"/pwm[0-9]; do
+    [[ -e "$p" ]] || continue
+    local n enable freq
+    n=${p##*/pwm}
+    enable=unknown
+    freq=unknown
+    [[ -e "$h/pwm${n}_enable" ]] && enable=$(cat "$h/pwm${n}_enable")
+    [[ -e "$h/pwm${n}_freq" ]] && freq=$(cat "$h/pwm${n}_freq")
+    printf 'pwm%s value=%s enable=%s freq=%s\n' "$n" "$(cat "$p")" "$enable" "$freq"
+  done
+}
+
+cmd_pwm_set() {
+  local channel=${1:-}
+  local value=${2:-}
+  [[ "$channel" =~ ^[0-9]+$ ]] || die "PWM channel must be a number"
+  [[ -n "$value" ]] || die "missing PWM value"
+  local h pwm parsed
+  h=$(hwmon_dir)
+  pwm="$h/pwm$channel"
+  [[ -e "$pwm" ]] || die "missing PWM channel: pwm$channel"
+  parsed=$(parse_pwm_value "$value")
+  [[ -e "$h/pwm${channel}_enable" ]] && sys_write 1 "$h/pwm${channel}_enable"
+  sys_write "$parsed" "$pwm"
+  printf 'pwm%s=%s\n' "$channel" "$parsed"
+}
+
+cmd_pwm_mode() {
+  local channel=${1:-}
+  local mode=${2:-}
+  [[ "$channel" =~ ^[0-9]+$ ]] || die "PWM channel must be a number"
+  [[ -n "$mode" ]] || die "missing PWM mode"
+  local h
+  h=$(hwmon_dir)
+  [[ -e "$h/pwm${channel}_enable" ]] || die "missing PWM enable for channel: pwm$channel"
+  sys_write "$(mode_value "$mode")" "$h/pwm${channel}_enable"
+}
+
+cmd_led() {
+  local action=${1:-}
+  shift || true
+  case "$action" in
+    list)
+      local led brightness trigger
+      for led in /sys/class/leds/*; do
+        [[ -d "$led" ]] || continue
+        led=${led##*/}
+        is_asustor_led "$led" || continue
+        brightness=$(cat "/sys/class/leds/$led/brightness" 2>/dev/null || printf '?')
+        trigger=$(cat "/sys/class/leds/$led/trigger" 2>/dev/null || printf '?')
+        printf '  %-22s brightness=%s trigger=%s\n' "$led" "$brightness" "$trigger"
+      done
+      ;;
+    set)
+      local name=${1:-}
+      local value=${2:-}
+      [[ -n "$name" && -n "$value" ]] || die "usage: asustorctl led set <led-name> <on|off|0|1>"
+      case "$value" in
+        on|1) value=1 ;;
+        off|0) value=0 ;;
+        *) die "LED value must be on, off, 1, or 0" ;;
+      esac
+      sys_write "$value" "$(led_path "$name")/brightness"
+      ;;
+    trigger)
+      local name=${1:-}
+      local trigger=${2:-}
+      [[ -n "$name" && -n "$trigger" ]] || die "usage: asustorctl led trigger <led-name> <trigger>"
+      sys_write "$trigger" "$(led_path "$name")/trigger"
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+}
+
+cmd_blink() {
+  local action=${1:-}
+  shift || true
+  local h slot value
+  h=$(hwmon_dir)
+  case "$action" in
+    status)
+      for f in "$h"/gpled*_blink "$h"/gpled*_blink_freq; do
+        [[ -e "$f" ]] || continue
+        printf '%s=%s\n' "${f##*/}" "$(cat "$f")"
+      done
+      ;;
+    set)
+      slot=${1:-}
+      value=${2:-}
+      [[ "$slot" =~ ^[0-9]+$ && -n "$value" ]] || die "usage: asustorctl blink set <slot> <gpio-number|0>"
+      [[ -e "$h/gpled${slot}_blink" ]] || die "missing blink slot: gpled${slot}_blink"
+      sys_write "$value" "$h/gpled${slot}_blink"
+      ;;
+    freq)
+      slot=${1:-}
+      value=${2:-}
+      [[ "$slot" =~ ^[0-9]+$ && "$value" =~ ^[0-9]+$ ]] || die "usage: asustorctl blink freq <slot> <mode>"
+      [[ -e "$h/gpled${slot}_blink_freq" ]] || die "missing blink frequency slot: gpled${slot}_blink_freq"
+      sys_write "$value" "$h/gpled${slot}_blink_freq"
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+}
+
+main() {
+  local cmd=${1:-}
+  shift || true
+  case "$cmd" in
+    status) cmd_status ;;
+    fan)
+      case "${1:-}" in
+        status) cmd_fan_status ;;
+        speed) shift; cmd_pwm_set "$DEFAULT_PWM" "${1:-}" ;;
+        mode) shift; cmd_pwm_mode "$DEFAULT_PWM" "${1:-}" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    pwm)
+      case "${1:-}" in
+        list) cmd_pwm_list ;;
+        set) shift; cmd_pwm_set "${1:-}" "${2:-}" ;;
+        mode) shift; cmd_pwm_mode "${1:-}" "${2:-}" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    led) cmd_led "$@" ;;
+    blink) cmd_blink "$@" ;;
+    -h|--help|help|'') usage ;;
+    *) die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"
+

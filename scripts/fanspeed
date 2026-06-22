@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+  printf 'Usage: fanspeed <0-255|percent%%>\n' >&2
+  printf 'Example: fanspeed 200\n' >&2
+  exit 2
+fi
+
+exec asustorctl fan speed "$1"
+
