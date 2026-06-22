@@ -34,6 +34,8 @@ After installing, these commands should be available from any directory:
 ```bash
 asustorctl status
 fanspeed 200
+cloud-nas-status
+cloud-nas-sync-now
 ```
 
 If you pull a newer version, reinstall the scripts so `/usr/local/bin` is
@@ -50,6 +52,7 @@ For a local user-only test without installing:
 ```bash
 ./scripts/asustorctl status
 ./scripts/fanspeed 200
+./scripts/cloud-nas-status
 ```
 
 ## Common Commands
@@ -150,6 +153,48 @@ Set blink slot 1 frequency mode to always-on when supported:
 asustorctl blink freq 1 11
 ```
 
+## Cloud NAS Commands
+
+These commands are convenience wrappers for the rclone NAS automation that
+syncs all configured rclone remotes into `NAS_03` and creates daily NAS_03
+snapshots on `NAS_02`.
+
+They expect the cloud automation files to already exist under:
+
+```text
+/home/atdang/.local/bin/cloud-nas-lib
+/home/atdang/.local/bin/cloud-nas-sync
+/home/atdang/.local/bin/cloud-nas-backup-to-nas02
+/home/atdang/.config/cloud-nas/cloud-nas.conf
+/home/atdang/.config/systemd/user/cloud-nas-*.service
+/home/atdang/.config/systemd/user/cloud-nas-*.timer
+```
+
+Print sync, timer, disk, remote, error, and backup status:
+
+```bash
+cloud-nas-status
+```
+
+Stop any active cloud sync and immediately start a fresh all-remotes sync:
+
+```bash
+cloud-nas-sync-now
+```
+
+The normal periodic sync timer still runs automatically:
+
+```bash
+systemctl --user list-timers 'cloud-nas*' --all
+```
+
+Watch live logs:
+
+```bash
+tail -f /home/atdang/.local/state/cloud-nas/rclone-sync-OneDrive-Personal.log
+tail -f /home/atdang/.local/state/cloud-nas/rclone-sync-GoogleDrive-Personal.log
+```
+
 ## Notes
 
 - `fanspeed 200` means raw PWM value `200`, on a `0..255` scale.
@@ -169,6 +214,8 @@ Check which copy is being run:
 ```bash
 command -v asustorctl
 command -v fanspeed
+command -v cloud-nas-status
+command -v cloud-nas-sync-now
 ```
 
 They should normally be:
@@ -176,6 +223,8 @@ They should normally be:
 ```text
 /usr/local/bin/asustorctl
 /usr/local/bin/fanspeed
+/usr/local/bin/cloud-nas-status
+/usr/local/bin/cloud-nas-sync-now
 ```
 
 Verify the installed scripts match the repo:
@@ -184,6 +233,8 @@ Verify the installed scripts match the repo:
 cd ~/GitHub/asustor-nas-control
 cmp -s scripts/asustorctl /usr/local/bin/asustorctl && echo asustorctl-ok || echo reinstall-asustorctl
 cmp -s scripts/fanspeed /usr/local/bin/fanspeed && echo fanspeed-ok || echo reinstall-fanspeed
+cmp -s scripts/cloud-nas-status /usr/local/bin/cloud-nas-status && echo cloud-nas-status-ok || echo reinstall-cloud-nas-status
+cmp -s scripts/cloud-nas-sync-now /usr/local/bin/cloud-nas-sync-now && echo cloud-nas-sync-now-ok || echo reinstall-cloud-nas-sync-now
 ```
 
 Read current fan/PWM state:
