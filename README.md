@@ -36,6 +36,7 @@ asustorctl status
 fanspeed 200
 cloud-nas-status
 cloud-nas-sync-now
+cloud-nas-watch
 ```
 
 If you pull a newer version, reinstall the scripts so `/usr/local/bin` is
@@ -53,6 +54,7 @@ For a local user-only test without installing:
 ./scripts/asustorctl status
 ./scripts/fanspeed 200
 ./scripts/cloud-nas-status
+./scripts/cloud-nas-watch --no-follow
 ```
 
 ## Common Commands
@@ -182,13 +184,31 @@ Stop any active cloud sync and immediately start a fresh all-remotes sync:
 cloud-nas-sync-now
 ```
 
+Stream the global cloud sync log and each configured remote's rclone log:
+
+```bash
+cloud-nas-watch
+```
+
+Print recent progress without following:
+
+```bash
+cloud-nas-watch --no-follow
+```
+
+Show more history before following:
+
+```bash
+cloud-nas-watch --lines 120
+```
+
 The normal periodic sync timer still runs automatically:
 
 ```bash
 systemctl --user list-timers 'cloud-nas*' --all
 ```
 
-Watch live logs:
+You can also watch individual logs directly:
 
 ```bash
 tail -f /home/atdang/.local/state/cloud-nas/rclone-sync-OneDrive-Personal.log
@@ -216,6 +236,7 @@ command -v asustorctl
 command -v fanspeed
 command -v cloud-nas-status
 command -v cloud-nas-sync-now
+command -v cloud-nas-watch
 ```
 
 They should normally be:
@@ -225,6 +246,7 @@ They should normally be:
 /usr/local/bin/fanspeed
 /usr/local/bin/cloud-nas-status
 /usr/local/bin/cloud-nas-sync-now
+/usr/local/bin/cloud-nas-watch
 ```
 
 Verify the installed scripts match the repo:
@@ -235,6 +257,7 @@ cmp -s scripts/asustorctl /usr/local/bin/asustorctl && echo asustorctl-ok || ech
 cmp -s scripts/fanspeed /usr/local/bin/fanspeed && echo fanspeed-ok || echo reinstall-fanspeed
 cmp -s scripts/cloud-nas-status /usr/local/bin/cloud-nas-status && echo cloud-nas-status-ok || echo reinstall-cloud-nas-status
 cmp -s scripts/cloud-nas-sync-now /usr/local/bin/cloud-nas-sync-now && echo cloud-nas-sync-now-ok || echo reinstall-cloud-nas-sync-now
+cmp -s scripts/cloud-nas-watch /usr/local/bin/cloud-nas-watch && echo cloud-nas-watch-ok || echo reinstall-cloud-nas-watch
 ```
 
 Read current fan/PWM state:
