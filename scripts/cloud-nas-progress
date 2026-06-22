@@ -67,11 +67,14 @@ human() {
 percent() {
   local local_bytes=$1
   local remote_bytes=$2
+  local remote_sizeless=${3:-0}
   if [[ -z "$remote_bytes" || "$remote_bytes" == "0" ]]; then
     printf 'n/a'
     return
   fi
-  awk -v l="$local_bytes" -v r="$remote_bytes" 'BEGIN { printf "%.1f%%", (l / r) * 100 }'
+  awk -v l="$local_bytes" -v r="$remote_bytes" -v s="$remote_sizeless" 'BEGIN {
+    printf "%.1f%%%s", (l / r) * 100, (s > 0 ? "*" : "")
+  }'
 }
 
 remote_extra_args() {
@@ -184,7 +187,7 @@ done
 
 print_snapshot() {
   printf '\n%s local NAS_03 mirror progress\n' "$(date '+%F %T')"
-  printf '%-24s %12s %12s %10s %10s %s\n' "remote" "local" "remote" "percent" "files" "note"
+  printf '%-24s %12s %12s %10s %10s %s\n' "remote" "local" "remote" "known%" "files" "note"
   printf '%-24s %12s %12s %10s %10s %s\n' "------------------------" "------------" "------------" "----------" "----------" "----"
 
   local remote safe target lbytes lfiles size_file remote_bytes remote_count remote_sizeless status note
@@ -209,7 +212,9 @@ print_snapshot() {
       if [[ "${status:-}" == "ok" ]]; then
         note="remote files=${remote_count}"
         if [[ "${remote_sizeless:-0}" != "0" ]]; then
-          note="${note}, sizeless=${remote_sizeless}"
+          note="${note}, sizeless=${remote_sizeless}; remote bytes are known-size only"
+        elif [[ "$lbytes" -gt "${remote_bytes:-0}" ]]; then
+          note="${note}; local larger, run rclone check"
         fi
       else
         note="remote size error"
@@ -220,7 +225,7 @@ print_snapshot() {
       "$remote" \
       "$(human "$lbytes")" \
       "$([[ -n "$remote_bytes" ]] && human "$remote_bytes" || printf '...')" \
-      "$(percent "$lbytes" "${remote_bytes:-}")" \
+      "$(percent "$lbytes" "${remote_bytes:-}" "${remote_sizeless:-0}")" \
       "$lfiles" \
       "$note"
   done

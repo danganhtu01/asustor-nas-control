@@ -204,6 +204,12 @@ The first run may show `remote sizing...` while rclone lists each cloud remote.
 When remote totals are available, the command prints local size, remote size,
 file count, and local-vs-remote percentage for each configured remote.
 
+If the percentage has a trailing `*`, the remote has objects whose byte size was
+not reported by the cloud provider. This is common with Google Drive native
+documents or other special objects. In that case, the remote byte total is only
+the known-size part of the drive, so the local copy can appear larger than
+`100%` even when `rclone check` reports that the comparable files match.
+
 Print one local/remote size snapshot and exit:
 
 ```bash
