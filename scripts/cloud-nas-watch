@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /home/atdang/.local/bin/cloud-nas-lib
+load_cloud_nas_config
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  cloud-nas-watch [--lines N] [--no-follow]
+
+Streams cloud NAS sync progress for every configured rclone remote.
+
+Options:
+  --lines N     Show the last N lines from each log before following. Default: 40.
+  --no-follow   Print recent progress and exit.
+USAGE
+}
+
+lines=40
+follow=1
+
+while (($#)); do
+  case "$1" in
+    --lines)
+      shift
+      [[ "${1:-}" =~ ^[0-9]+$ ]] || {
+        echo "error: --lines requires a number" >&2
+        exit 2
+      }
+      lines=$1
+      ;;
+    --no-follow)
+      follow=0
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "error: unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+log_files=("$CLOUD_NAS_STATE_DIR/sync.log")
+
+while IFS= read -r remote; do
+  [[ -n "$remote" ]] || continue
+  safe=$(safe_remote_name "$remote")
+  log_files+=("$CLOUD_NAS_STATE_DIR/rclone-sync-${safe}.log")
+done < <(configured_remotes)
+
+existing=()
+for log in "${log_files[@]}"; do
+  [[ -e "$log" ]] && existing+=("$log")
+done
+
+if ((${#existing[@]} == 0)); then
+  echo "no sync logs found under $CLOUD_NAS_STATE_DIR"
+  echo "start a sync with: cloud-nas-sync-now"
+  exit 1
+fi
+
+echo "cloud NAS sync logs:"
+for log in "${existing[@]}"; do
+  echo "  $log"
+done
+
+echo
+systemctl --user --no-pager --plain status cloud-nas-sync.service 2>/dev/null | sed -n '1,18p' || true
+echo
+
+tail_args=(-n "$lines")
+if ((follow)); then
+  tail_args+=(-F)
+fi
+
+tail "${tail_args[@]}" "${existing[@]}"
