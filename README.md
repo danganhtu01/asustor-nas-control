@@ -22,7 +22,28 @@ cd asustor-nas-control
 ./scripts/install.sh
 ```
 
-The installer copies commands into `/usr/local/bin`, so it uses `sudo`.
+The installer copies commands into `/usr/local/bin`. Run it normally or with
+`sudo`; if needed, it will re-run itself through `sudo`.
+
+```bash
+sudo ./scripts/install.sh
+```
+
+After installing, these commands should be available from any directory:
+
+```bash
+asustorctl status
+fanspeed 200
+```
+
+If you pull a newer version, reinstall the scripts so `/usr/local/bin` is
+updated:
+
+```bash
+cd ~/GitHub/asustor-nas-control
+git pull
+sudo ./scripts/install.sh
+```
 
 For a local user-only test without installing:
 
@@ -39,10 +60,22 @@ Set the primary fan PWM value to `200`:
 fanspeed 200
 ```
 
+Expected output:
+
+```text
+pwm1=200
+```
+
 Use a percent instead:
 
 ```bash
 fanspeed 70%
+```
+
+Expected output:
+
+```text
+pwm1=179
 ```
 
 Show current fan, PWM, temperature, and LED state:
@@ -63,12 +96,20 @@ Set a specific PWM channel:
 asustorctl pwm set 1 200
 ```
 
+Expected output:
+
+```text
+pwm1=200
+```
+
 Set the primary fan mode:
 
 ```bash
 asustorctl fan mode manual
 asustorctl fan mode auto
 ```
+
+Manual mode writes `pwm1_enable=1`; auto mode writes `pwm1_enable=2`.
 
 List LEDs:
 
@@ -115,24 +156,46 @@ asustorctl blink freq 1 11
 - The script defaults to PWM channel `1`, matching the observed AS6704 fan.
 - Override the channel with `ASUSTOR_FAN_PWM=2 fanspeed 180`.
 - Write operations require root because sysfs hardware controls are root-owned.
+- Write commands print the value they changed. If `fanspeed 200` returns no
+  output, you are probably running an old installed copy; run
+  `sudo ./scripts/install.sh` again from the repo.
 - Wrong GPIO/PWM writes can make hardware behave strangely. Use the status
   command first and change one thing at a time.
 
-## Publish This Repo
+## Troubleshooting
 
-This machine did not have GitHub CLI auth or SSH auth available when the repo
-was created. To publish it later:
-
-```bash
-sudo pacman -S github-cli
-gh auth login
-gh repo create danganhtu01/asustor-nas-control --public --source . --remote origin --push
-```
-
-Or create an empty repository at GitHub, then:
+Check which copy is being run:
 
 ```bash
-git remote add origin git@github.com:danganhtu01/asustor-nas-control.git
-git push -u origin main
+command -v asustorctl
+command -v fanspeed
 ```
 
+They should normally be:
+
+```text
+/usr/local/bin/asustorctl
+/usr/local/bin/fanspeed
+```
+
+Verify the installed scripts match the repo:
+
+```bash
+cd ~/GitHub/asustor-nas-control
+cmp -s scripts/asustorctl /usr/local/bin/asustorctl && echo asustorctl-ok || echo reinstall-asustorctl
+cmp -s scripts/fanspeed /usr/local/bin/fanspeed && echo fanspeed-ok || echo reinstall-fanspeed
+```
+
+Read current fan/PWM state:
+
+```bash
+asustorctl fan status
+asustorctl pwm list
+```
+
+If a write command prompts for a password, that is expected. It is writing to
+root-owned sysfs files such as:
+
+```text
+/sys/devices/platform/asustor_it87.*/hwmon/hwmon*/pwm1
+```
