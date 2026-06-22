@@ -172,6 +172,41 @@ They expect the cloud automation files to already exist under:
 /home/atdang/.config/systemd/user/cloud-nas-*.timer
 ```
 
+### Headless Monitoring Workflow
+
+After SSH login, check the whole cloud/NAS pipeline:
+
+```bash
+cloud-nas-status
+```
+
+Start a fresh sync of every configured rclone remote:
+
+```bash
+cloud-nas-sync-now
+```
+
+Stream progress for every drive/remoted cloud provider:
+
+```bash
+cloud-nas-watch
+```
+
+For a quick one-shot view without staying attached to the terminal:
+
+```bash
+cloud-nas-watch --no-follow
+```
+
+If you want more recent log history before live streaming starts:
+
+```bash
+cloud-nas-watch --lines 120
+```
+
+Detach safely with `Ctrl-C`; this only stops your log viewer, not the systemd
+sync service.
+
 Print sync, timer, disk, remote, error, and backup status:
 
 ```bash
