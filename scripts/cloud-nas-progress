@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source /home/atdang/.local/bin/cloud-nas-lib
+load_cloud_nas_config
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  cloud-nas-progress [--interval SECONDS] [--once]
+
+Polls each NAS_03 local cloud mirror size and compares it with the matching
+rclone remote size.
+
+Remote sizes are calculated once in the background when the command starts.
+Local sizes are refreshed every 5 seconds by default.
+
+Options:
+  --interval SECONDS  Poll local sizes every N seconds. Default: 5.
+  --once              Print one snapshot and exit.
+USAGE
+}
+
+interval=5
+once=0
+
+while (($#)); do
+  case "$1" in
+    --interval)
+      shift
+      [[ "${1:-}" =~ ^[0-9]+$ && "${1:-}" -gt 0 ]] || {
+        echo "error: --interval requires a positive number" >&2
+        exit 2
+      }
+      interval=$1
+      ;;
+    --once)
+      once=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "error: unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+human() {
+  local bytes=${1:-0}
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --to=iec-i --suffix=B "$bytes"
+  else
+    awk -v b="$bytes" 'BEGIN {
+      split("B KiB MiB GiB TiB", u, " ");
+      i = 1;
+      while (b >= 1024 && i < 5) { b /= 1024; i++ }
+      printf "%.2f %s", b, u[i]
+    }'
+  fi
+}
+
+percent() {
+  local local_bytes=$1
+  local remote_bytes=$2
+  if [[ -z "$remote_bytes" || "$remote_bytes" == "0" ]]; then
+    printf 'n/a'
+    return
+  fi
+  awk -v l="$local_bytes" -v r="$remote_bytes" 'BEGIN { printf "%.1f%%", (l / r) * 100 }'
+}
+
+remote_extra_args() {
+  local remote=$1
+  local remote_type
+  remote_type=$(rclone config show "$remote" 2>/dev/null | awk -F' = ' '$1 == "type" {print $2; exit}')
+  case "$remote_type" in
+    drive)
+      printf '%s\n' "--drive-skip-shortcuts"
+      ;;
+    onedrive)
+      printf '%s\n' "--exclude"
+      printf '%s\n' "/Personal Vault/**"
+      ;;
+  esac
+}
+
+json_field() {
+  local field=$1
+  sed -n "s/.*\"$field\"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" | head -n 1
+}
+
+remote_size_file() {
+  printf '%s/remote-size-%s.env\n' "$CLOUD_NAS_STATE_DIR" "$1"
+}
+
+start_remote_size_job() {
+  local remote=$1
+  local safe=$2
+  local out
+  out=$(remote_size_file "$safe")
+  (
+    set +e
+    mapfile -t extra < <(remote_extra_args "$remote")
+    tmp="${out}.tmp"
+    json="${out}.json"
+    err="${out}.err"
+    started=$(date --iso-8601=seconds)
+    rclone size "${remote}:" "${extra[@]}" --json >"$json" 2>"$err"
+    status=$?
+    finished=$(date --iso-8601=seconds)
+    if ((status == 0)); then
+      bytes=$(json_field bytes <"$json")
+      count=$(json_field count <"$json")
+      sizeless=$(json_field sizeless <"$json")
+      {
+        printf 'status=ok\n'
+        printf 'remote=%q\n' "$remote"
+        printf 'bytes=%q\n' "${bytes:-0}"
+        printf 'count=%q\n' "${count:-0}"
+        printf 'sizeless=%q\n' "${sizeless:-0}"
+        printf 'started=%q\n' "$started"
+        printf 'finished=%q\n' "$finished"
+      } >"$tmp"
+    else
+      {
+        printf 'status=error\n'
+        printf 'remote=%q\n' "$remote"
+        printf 'bytes=0\n'
+        printf 'count=0\n'
+        printf 'sizeless=0\n'
+        printf 'started=%q\n' "$started"
+        printf 'finished=%q\n' "$finished"
+        printf 'error=%q\n' "$(tail -n 3 "$err" | tr '\n' ' ')"
+      } >"$tmp"
+    fi
+    mv "$tmp" "$out"
+  ) &
+  pids+=("$!")
+}
+
+local_bytes() {
+  local path=$1
+  if [[ ! -d "$path" ]]; then
+    printf '0'
+    return
+  fi
+  du -sb "$path" 2>/dev/null | awk '{print $1}'
+}
+
+local_file_count() {
+  local path=$1
+  if [[ ! -d "$path" ]]; then
+    printf '0'
+    return
+  fi
+  find "$path" -type f 2>/dev/null | wc -l | tr -d ' '
+}
+
+cleanup() {
+  if ((${#pids[@]} > 0)); then
+    kill "${pids[@]}" >/dev/null 2>&1 || true
+  fi
+}
+
+mkdir -p "$CLOUD_NAS_STATE_DIR"
+mapfile -t remotes < <(configured_remotes)
+if ((${#remotes[@]} == 0)); then
+  echo "no rclone remotes configured; run: rclone config"
+  exit 1
+fi
+
+pids=()
+trap cleanup EXIT INT TERM
+
+for remote in "${remotes[@]}"; do
+  safe=$(safe_remote_name "$remote")
+  start_remote_size_job "$remote" "$safe"
+done
+
+print_snapshot() {
+  printf '\n%s local NAS_03 mirror progress\n' "$(date '+%F %T')"
+  printf '%-24s %12s %12s %10s %10s %s\n' "remote" "local" "remote" "percent" "files" "note"
+  printf '%-24s %12s %12s %10s %10s %s\n' "------------------------" "------------" "------------" "----------" "----------" "----"
+
+  local remote safe target lbytes lfiles size_file remote_bytes remote_count remote_sizeless status note
+  for remote in "${remotes[@]}"; do
+    safe=$(safe_remote_name "$remote")
+    target="$NAS03_TARGET/$safe"
+    lbytes=$(local_bytes "$target")
+    lfiles=$(local_file_count "$target")
+    size_file=$(remote_size_file "$safe")
+    remote_bytes=""
+    remote_count=""
+    remote_sizeless=""
+    status="pending"
+    note="remote sizing..."
+
+    if [[ -r "$size_file" ]]; then
+      # shellcheck disable=SC1090
+      source "$size_file"
+      remote_bytes=${bytes:-0}
+      remote_count=${count:-0}
+      remote_sizeless=${sizeless:-0}
+      if [[ "${status:-}" == "ok" ]]; then
+        note="remote files=${remote_count}"
+        if [[ "${remote_sizeless:-0}" != "0" ]]; then
+          note="${note}, sizeless=${remote_sizeless}"
+        fi
+      else
+        note="remote size error"
+      fi
+    fi
+
+    printf '%-24s %12s %12s %10s %10s %s\n' \
+      "$remote" \
+      "$(human "$lbytes")" \
+      "$([[ -n "$remote_bytes" ]] && human "$remote_bytes" || printf '...')" \
+      "$(percent "$lbytes" "${remote_bytes:-}")" \
+      "$lfiles" \
+      "$note"
+  done
+}
+
+while true; do
+  print_snapshot
+  ((once)) && break
+  sleep "$interval"
+done

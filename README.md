@@ -37,6 +37,7 @@ fanspeed 200
 cloud-nas-status
 cloud-nas-sync-now
 cloud-nas-watch
+cloud-nas-progress
 ```
 
 If you pull a newer version, reinstall the scripts so `/usr/local/bin` is
@@ -55,6 +56,7 @@ For a local user-only test without installing:
 ./scripts/fanspeed 200
 ./scripts/cloud-nas-status
 ./scripts/cloud-nas-watch --no-follow
+./scripts/cloud-nas-progress --once
 ```
 
 ## Common Commands
@@ -192,6 +194,28 @@ Stream progress for every drive/remoted cloud provider:
 cloud-nas-watch
 ```
 
+Poll local NAS_03 mirror sizes every 5 seconds and compare with remote sizes:
+
+```bash
+cloud-nas-progress
+```
+
+The first run may show `remote sizing...` while rclone lists each cloud remote.
+When remote totals are available, the command prints local size, remote size,
+file count, and local-vs-remote percentage for each configured remote.
+
+Print one local/remote size snapshot and exit:
+
+```bash
+cloud-nas-progress --once
+```
+
+Use a different poll interval:
+
+```bash
+cloud-nas-progress --interval 10
+```
+
 For a quick one-shot view without staying attached to the terminal:
 
 ```bash
@@ -272,6 +296,7 @@ command -v fanspeed
 command -v cloud-nas-status
 command -v cloud-nas-sync-now
 command -v cloud-nas-watch
+command -v cloud-nas-progress
 ```
 
 They should normally be:
@@ -282,6 +307,7 @@ They should normally be:
 /usr/local/bin/cloud-nas-status
 /usr/local/bin/cloud-nas-sync-now
 /usr/local/bin/cloud-nas-watch
+/usr/local/bin/cloud-nas-progress
 ```
 
 Verify the installed scripts match the repo:
@@ -293,6 +319,7 @@ cmp -s scripts/fanspeed /usr/local/bin/fanspeed && echo fanspeed-ok || echo rein
 cmp -s scripts/cloud-nas-status /usr/local/bin/cloud-nas-status && echo cloud-nas-status-ok || echo reinstall-cloud-nas-status
 cmp -s scripts/cloud-nas-sync-now /usr/local/bin/cloud-nas-sync-now && echo cloud-nas-sync-now-ok || echo reinstall-cloud-nas-sync-now
 cmp -s scripts/cloud-nas-watch /usr/local/bin/cloud-nas-watch && echo cloud-nas-watch-ok || echo reinstall-cloud-nas-watch
+cmp -s scripts/cloud-nas-progress /usr/local/bin/cloud-nas-progress && echo cloud-nas-progress-ok || echo reinstall-cloud-nas-progress
 ```
 
 Read current fan/PWM state:
