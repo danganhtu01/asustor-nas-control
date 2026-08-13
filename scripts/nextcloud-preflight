@@ -68,12 +68,13 @@ Exit status:
 USAGE
 }
 
-# Answered before the sudo re-exec so --help never asks for a password.
-for arg in "$@"; do
-  case "$arg" in
-    -h|--help|help) usage; exit 0 ;;
-  esac
-done
+# Answered before the sudo re-exec so --help never asks for a password. Only $1
+# is inspected: scanning every argument would let an option VALUE such as
+# `--admin-user help` print usage and exit 0, which nextcloud-install reads as
+# "all preconditions passed".
+case "${1:-}" in
+  -h|--help|help) usage; exit 0 ;;
+esac
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   exec sudo -- "$0" "$@"
@@ -606,7 +607,7 @@ check_existing_serve() {
     if jq -e '((.TCP // {}) | has("443")) or ((.Web // {}) | keys[]? | endswith(":443"))' "$TS_SERVE_JSON" >/dev/null 2>&1; then
       busy=1
     fi
-  elif printf '%s' "$dump" | grep -q '443'; then
+  elif grep -q '443' <<<"$dump"; then
     # Without jq the match is deliberately coarse: refusing to overwrite a
     # handler that might exist is the safe direction of the two errors.
     busy=1
@@ -1022,7 +1023,7 @@ check_pipeline_scripts() {
     if [[ -n "$calls" ]]; then
       note '   transfer and snapshot invocations:'
       printf '     %s\n' "$calls"
-      if printf '%s' "$calls" | grep -qE 'btrfs[[:space:]]+subvolume|zfs[[:space:]]+(snapshot|send)|snapshot'; then
+      if grep -qE 'btrfs[[:space:]]+subvolume|zfs[[:space:]]+(snapshot|send)|snapshot' <<<"$calls"; then
         snapshots=1
       fi
     fi
@@ -1316,7 +1317,7 @@ check_docker_objects() {
 
   # The storage driver is READ, never predicted from the filesystem type.
   note "docker:     $(docker info --format '{{.Driver}} {{.DockerRootDir}} {{.CgroupDriver}}/{{.CgroupVersion}}' 2>/dev/null || printf unknown)"
-  if printf '%s\n' "$info_out" | grep -q 'No memory limit support'; then
+  if grep -q 'No memory limit support' <<<"$info_out"; then
     die \
       'read the WARNING lines from docker info' \
       'docker info reports: No memory limit support' \
@@ -1618,7 +1619,7 @@ check_cert_retry_loop() {
   # The grep line-number prefix and any comment are stripped first, so that a
   # comment explaining why there is no retry is not itself read as one.
   scan=$(printf '%s\n' "$ctx" | sed -e 's/^[0-9]*[-:]//' -e 's/#.*$//')
-  if printf '%s\n' "$scan" | grep -qE '^[[:space:]]*(while|until|for)[[:space:]]|(^|[;&|[:space:]])retry([[:space:]]|$)'; then
+  if grep -qE '^[[:space:]]*(while|until|for)[[:space:]]|(^|[;&|[:space:]])retry([[:space:]]|$)' <<<"$scan"; then
     note 'context:'
     printf '  %s\n' "$ctx"
     die \
@@ -1759,13 +1760,23 @@ print_summary() {
   cmd="$cmd --subnet $NC_SUBNET --fqdn $NC_FQDN"
   [[ -z "$opt_tz" ]] || cmd="$cmd --tz $opt_tz"
   [[ -z "$opt_admin_user" ]] || cmd="$cmd --admin-user $opt_admin_user"
-  [[ "$opt_subnet_router" != yes ]] || cmd="$cmd --subnet-router"
+  if [[ "$opt_subnet_router" == yes ]]; then
+    cmd="$cmd --subnet-router"
+  else
+    cmd="$cmd --no-subnet-router"
+  fi
   (( opt_allow_rootfs == 0 )) || cmd="$cmd --allow-rootfs"
   (( opt_accept_low_ram == 0 )) || cmd="$cmd --accept-low-ram"
-  (( opt_setup_zram == 0 )) || cmd="$cmd --setup-zram"
   cmd="$cmd --accept-ct-log"
 
   section 'NEXT'
+  # --setup-zram is deliberately NOT folded into the line above: here it is an
+  # acknowledgement, but in nextcloud-install it is a mode that configures zram
+  # and exits without installing anything.
+  if (( opt_setup_zram == 1 )); then
+    printf 'nextcloud-install --setup-zram    # run this FIRST: configures zram, then exits\n'
+    printf '\n'
+  fi
   printf '%s\n' "$cmd"
   printf '\n'
   printf 'ALL PREFLIGHT CHECKS PASSED — baseline: %s\n' "$BASELINE_DIR"

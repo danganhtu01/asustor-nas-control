@@ -546,6 +546,10 @@ if [[ "$ZRAM_BY_US" == 1 ]]; then
   else
     note "$ZRAM_FILE is already absent"
   fi
+  if [[ -e "$STATE_DIR/zram-by-us" ]]; then
+    rm -f -- "$STATE_DIR/zram-by-us"
+    note "removed $STATE_DIR/zram-by-us"
+  fi
   warn 'the zram device already in use stays until a reboot; this command will not swapoff a 4 GB box mid-teardown'
 else
   note "ZRAM_BY_US=$ZRAM_BY_US; leaving $ZRAM_FILE alone"
@@ -565,7 +569,17 @@ else
   note "DOCKER_ENABLED_BY_US=$DOCKER_ENABLED_BY_US; docker.service and docker.socket are left exactly as they were"
 fi
 
-step "Step 8: remove $CONF_DIR and the installed commands"
+# Deliberately BEFORE the state file and this command are removed: purge_tree has
+# several independent refusal paths, and a refusal must never leave the operator
+# with an unpurged tree, no nextcloud-uninstall and no state file to retry from.
+step 'Step 8: the data on the array'
+if [[ "$purge_data" -eq 1 ]]; then
+  purge_tree
+else
+  note "--purge-data was not given, so $NC_ROOT is left in place"
+  note "  including ${SQL_OUT##*/} and ${CFG_OUT##*/}, which are the only copies of the database and config.php"
+fi
+step "Step 9: remove $CONF_DIR and the installed commands"
 rm -rf -- "${CONF_DIR:?}"
 note "removed $CONF_DIR"
 # Unlinking the running script only drops its name: this process keeps its open
@@ -591,13 +605,6 @@ else
   note "keeping $STATE_DIR/baseline-* - the evidence that nothing else on the box was disturbed. Pass --purge-baselines to remove them."
 fi
 
-step 'Step 9: the data on the array'
-if [[ "$purge_data" -eq 1 ]]; then
-  purge_tree
-else
-  note "--purge-data was not given, so $NC_ROOT is left in place"
-  note "  including ${SQL_OUT##*/} and ${CFG_OUT##*/}, which are the only copies of the database and config.php"
-fi
 
 step 'Step 10: what unavoidably remains'
 cat <<EOF

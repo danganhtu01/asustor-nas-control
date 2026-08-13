@@ -25,12 +25,13 @@ Exit status:
 USAGE
 }
 
-# Answered before the sudo re-exec so --help never asks for a password.
-for arg in "$@"; do
-  case "$arg" in
-    -h|--help|help) usage; exit 0 ;;
-  esac
-done
+# Answered before the sudo re-exec so --help never asks for a password. Only $1
+# is inspected: scanning every argument would let an option VALUE such as
+# `--admin-user help` print usage and exit 0, which nextcloud-install reads as
+# "all preconditions passed".
+case "${1:-}" in
+  -h|--help|help) usage; exit 0 ;;
+esac
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
   exec sudo -- "$0" "$@"

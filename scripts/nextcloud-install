@@ -121,6 +121,24 @@ need_value() {
     "see nextcloud-install --help"
 }
 
+# Kept because the loop below shifts "$@" away, and nextcloud-preflight is
+# invoked with the operator's original command line.
+NCT_ARGV=("$@")
+
+# preflight accepts --opt=value as well as --opt value; normalise so this
+# parser cannot refuse a line preflight itself printed. The subnet-router flags
+# are booleans and are matched whole, not split.
+_norm=()
+for _a in "$@"; do
+  case "$_a" in
+    --subnet-router=*|--no-subnet-router) _norm+=("$_a") ;;
+    --*=*) _norm+=("${_a%%=*}" "${_a#*=}") ;;
+    *) _norm+=("$_a") ;;
+  esac
+done
+set -- ${_norm[@]+"${_norm[@]}"}
+unset _norm _a
+
 while (($#)); do
   case "$1" in
     --root)
@@ -168,7 +186,8 @@ while (($#)); do
       GUARD_PATHS+=("$2")
       shift
       ;;
-    --subnet-router) SUBNET_ROUTER=1 ;;
+    --subnet-router|--subnet-router=y|--subnet-router=yes|--subnet-router=true|--subnet-router=1) SUBNET_ROUTER=1 ;;
+    --no-subnet-router|--subnet-router=n|--subnet-router=no|--subnet-router=false|--subnet-router=0) SUBNET_ROUTER=0 ;;
     --install-docker) INSTALL_DOCKER=1 ;;
     --i-understand-kernel-risk) KERNEL_RISK=1 ;;
     --setup-zram) SETUP_ZRAM=1 ;;
@@ -264,9 +283,14 @@ ZRAM
   note "  nextcloud-preflight --root <path> ..."
   note "  nextcloud-install --root <path> ..."
   note ''
-  note 'nextcloud-uninstall removes this file only when ZRAM_BY_US=1 is recorded,'
-  note 'which happens on the install run, not on this one. Remove it by hand if'
-  note 'you abandon the trial before installing.'
+  # This run exits before write_conf, so record the fact on disk; the install
+  # run reads it back and only then can nextcloud-uninstall remove the file.
+  install -d -m 0700 -- "$NCT_STATE"
+  : >"$NCT_STATE/zram-by-us"
+
+  note 'nextcloud-uninstall will remove this file, because the install run reads'
+  note "$NCT_STATE/zram-by-us and records ZRAM_BY_US=1. If you abandon the trial"
+  note 'before installing, remove both by hand.'
 }
 
 if (( SETUP_ZRAM )); then
@@ -281,7 +305,7 @@ command -v nextcloud-preflight >/dev/null 2>&1 || die \
   'nextcloud-preflight installed in /usr/local/bin' \
   'run ./scripts/install.sh from the asustor-nas-control checkout, then re-run this'
 
-nextcloud-preflight "$@" || exit 1
+nextcloud-preflight ${NCT_ARGV[@]+"${NCT_ARGV[@]}"} || exit 1
 
 step 'Discovery'
 
@@ -399,6 +423,9 @@ for d in "$NCT_STATE"/baseline-*; do
   BASELINE_DIR="$d"
 done
 [[ -n "$BASELINE_DIR" ]] || warn "no baseline directory under $NCT_STATE; nextcloud-postflight will have nothing to diff against"
+
+# Left by an earlier --setup-zram run, which exits before write_conf.
+[[ ! -e "$NCT_STATE/zram-by-us" ]] || ZRAM_BY_US=1
 
 note "owner:        $NC_OWNER (uid $NC_OWNER_UID, home $NC_OWNER_HOME)"
 note "tailnet ip:   $NC_TSIP"
@@ -602,7 +629,7 @@ pacman_install_docker() {
 
   # Not gated on the word "linux" alone: the whole list is shown and consented
   # to, and the kernel test below is a second, independent gate.
-  if printf '%s\n' "$list" | grep -qE '^linux(-lts|-zen|-hardened)? '; then
+  if grep -qE '^linux(-lts|-zen|-hardened)? ' <<<"$list"; then
     if dkms status 2>/dev/null | grep -q asustor; then
       warn 'the transaction upgrades the kernel, but the asustor modules are DKMS-managed and will be rebuilt'
     elif pacman -Qo "$(modinfo -n asustor 2>/dev/null || printf /nonexistent)" >/dev/null 2>&1; then
@@ -697,7 +724,7 @@ for tag in "$NC_IMAGE" "$DB_IMAGE" "$REDIS_IMAGE"; do
     "resolved the image tag $tag against the registry, before creating any directory" \
     "docker manifest inspect $tag failed" \
     'a tag that exists and a reachable registry' \
-    "either the registry is unreachable from this box or the tag is wrong; redis:8-alpine in particular was never independently verified and its documented fallback is redis:7-alpine - edit REDIS_IMAGE near the top of $0 if that is the failing tag"
+    "either the registry is unreachable from this box or the tag is wrong; redis:8-alpine in particular was never independently verified and its documented fallback is redis:7-alpine - edit REDIS_IMAGE at the top of BOTH /usr/local/bin/nextcloud-preflight and /usr/local/bin/nextcloud-install if that is the failing tag, because the preflight pins its own copy and refuses before this check is reached"
   note "  $tag resolves"
 done
 
@@ -980,7 +1007,7 @@ name: ${NC_PROJECT:?}
 services:
   app:
     image: ${NC_IMAGE:?}
-    container_name: nc-app
+    container_name: ${NC_PROJECT:?}-app
     restart: unless-stopped
     depends_on:
       db:
@@ -1030,7 +1057,7 @@ services:
 
   db:
     image: ${DB_IMAGE:?}
-    container_name: nc-db
+    container_name: ${NC_PROJECT:?}-db
     restart: unless-stopped
     command:
       - postgres
@@ -1060,7 +1087,7 @@ services:
 
   redis:
     image: ${REDIS_IMAGE:?}
-    container_name: nc-redis
+    container_name: ${NC_PROJECT:?}-redis
     restart: unless-stopped
     # Persistence off and no eviction policy: a maxmemory-policy other than
     # noeviction would silently drop Nextcloud's file locks.
@@ -1087,7 +1114,7 @@ COMPOSE_HEAD
 
   cron:
     image: ${NC_IMAGE:?}
-    container_name: nc-cron
+    container_name: ${NC_PROJECT:?}-cron
     restart: unless-stopped
     # The entrypoint override bypasses the image's PHP env templating, which is
     # why the same php ini has to be bind-mounted here too.
@@ -1220,15 +1247,20 @@ compose pull
 compose up -d
 note 'stack started'
 
-step '11/14  Wait for nc-app to become healthy'
+step "11/14  Wait for the ${NC_PROJECT}-app container to become healthy"
 
 # 60 x 10s: the first start rsyncs the whole Nextcloud tree into the html volume
 # and takes minutes on an N5105.
 health=''
 for i in $(seq 1 60); do
-  health=$(docker inspect -f '{{ if .State.Health }}{{ .State.Health.Status }}{{ else }}nohealthcheck{{ end }}' nc-app 2>/dev/null || true)
+  cid=$(compose ps -q app 2>/dev/null || true)
+  if [[ -n "$cid" ]]; then
+    health=$(docker inspect -f '{{ if .State.Health }}{{ .State.Health.Status }}{{ else }}nohealthcheck{{ end }}' "$cid" 2>/dev/null || true)
+  else
+    health=''
+  fi
   [[ "$health" == healthy ]] && break
-  printf '  %3ss  nc-app: %s\n' "$(( i * 10 ))" "${health:-not created yet}"
+  printf '  %3ss  %s-app: %s\n' "$(( i * 10 ))" "$NC_PROJECT" "${health:-not created yet}"
   sleep 10
 done
 
@@ -1236,12 +1268,12 @@ if [[ "$health" != healthy ]]; then
   printf '\nlast 100 lines from the app container:\n' >&2
   compose logs --tail=100 app >&2 || true
   die \
-    'waited 600 seconds for the nc-app container to report healthy' \
+    "waited 600 seconds for the ${NC_PROJECT}-app container to report healthy" \
     "its health status is '${health:-unknown}'" \
     'healthy' \
     'read the log above; the stack is up but not serving, so nothing was configured with occ and nothing was declared working'
 fi
-note 'nc-app is healthy'
+note "${NC_PROJECT}-app is healthy"
 
 step '12/14  occ configuration'
 
@@ -1312,7 +1344,7 @@ fi
 
 if (( CRON_OK )); then
   if occ background:cron >/dev/null 2>&1; then
-    note 'background jobs set to Cron mode, served by the nc-cron sidecar'
+    note "background jobs set to Cron mode, served by the ${NC_PROJECT}-cron sidecar"
   else
     warn 'occ background:cron is unavailable; the mode flips to Cron by itself once cron.php runs from the command line'
   fi

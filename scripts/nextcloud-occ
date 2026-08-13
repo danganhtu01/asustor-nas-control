@@ -17,6 +17,10 @@ fi
 source /usr/local/bin/nextcloud-lib
 require_conf
 
+# Runs occ inside the nextcloud-trial app container, addressed from
+# /etc/nextcloud-trial/nextcloud-trial.conf. The literal 'nextcloud-trial' above is
+# also what scripts/install.sh looks for before it will overwrite this file.
+#
 # -T is mandatory, not cosmetic: without it every non-interactive call fails
 # with 'the input device is not a TTY' and aborts the caller under pipefail.
 exec docker compose -f "${NC_ROOT}/compose.yaml" --project-name "$NC_PROJECT" exec -T -u www-data app php occ "$@"
