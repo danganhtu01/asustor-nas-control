@@ -1,0 +1,1445 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+NCT_LIB=/usr/local/bin/nextcloud-lib
+if [[ ! -r "$NCT_LIB" ]]; then
+  printf 'error: checked for the sourced helper library before doing anything else\n' >&2
+  printf '  found:    %s is missing or unreadable\n' "$NCT_LIB" >&2
+  printf '  expected: nextcloud-lib installed beside the other nextcloud-* commands\n' >&2
+  printf '  fix:      run ./scripts/install.sh from the asustor-nas-control checkout, then re-run this\n' >&2
+  exit 1
+fi
+# shellcheck source=/dev/null
+source "$NCT_LIB"
+
+# Pinned deliberately, never floating. nextcloud:34.0.2-apache was confirmed on
+# Docker Hub; redis:8-alpine was NOT independently verified and its documented
+# fallback is redis:7-alpine - that is the one value here worth editing if the
+# image-tag step refuses.
+NC_IMAGE=nextcloud:34.0.2-apache
+DB_IMAGE=postgres:18-alpine
+REDIS_IMAGE=redis:8-alpine
+
+NCT_ETC=/etc/nextcloud-trial
+NCT_CONF="$NCT_ETC/nextcloud-trial.conf"
+NCT_STATE=/var/lib/nextcloud-trial
+SYSCTL_FILE=/etc/sysctl.d/99-nextcloud-trial-forward.conf
+OOM_DROPIN_DIR=/etc/systemd/system/tailscaled.service.d
+OOM_DROPIN="$OOM_DROPIN_DIR/10-nextcloud-trial-oom.conf"
+ZRAM_CONF=/etc/systemd/zram-generator.conf
+
+NC_ROOT=''
+NC_PROJECT=nextcloud-trial
+NC_HTTP_PORT=8080
+NC_SUBNET=''
+NC_FQDN=''
+NC_TZ=''
+NC_ADMIN_USER=ncadmin
+CNC_CONF=''
+GUARD_PATHS=()
+SUBNET_ROUTER=0
+INSTALL_DOCKER=0
+KERNEL_RISK=0
+SETUP_ZRAM=0
+
+NC_OWNER=''
+NC_OWNER_HOME=''
+NC_OWNER_UID=''
+NC_TSIP=''
+RAM_PROFILE=''
+BASELINE_DIR=''
+CRON_OK=0
+DOCKER_ENABLED_BY_US=0
+TS_SERVE_SET_BY_US=0
+ZRAM_BY_US=0
+SYSCTL_BY_US=0
+OOMADJ_BY_US=0
+
+POSTGRES_DB=nextcloud
+POSTGRES_USER=nextcloud
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  nextcloud-install --root PATH [options]
+  nextcloud-install --setup-zram
+  nextcloud-install --install-docker --i-understand-kernel-risk --root PATH [options]
+
+Installs the Nextcloud trial Compose stack. This is the only command in the set
+that changes anything. Its first action is to run nextcloud-preflight with the
+same arguments; it stops on the first refusal.
+
+Options:
+  --root PATH        Absolute path on the array for the Nextcloud tree. Required.
+  --port N           Loopback port to publish. Default: 8080.
+  --project NAME     Compose project name. Default: nextcloud-trial.
+  --subnet CIDR      Bridge subnet, used verbatim as TRUSTED_PROXIES.
+  --fqdn NAME        Tailnet FQDN. Read back from tailscale serve when omitted.
+  --tz ZONE          Container timezone. Default: the host timezone.
+  --admin-user NAME  Nextcloud admin account. Default: ncadmin.
+  --conf PATH        cloud-nas.conf to read the containment guards from.
+  --guard PATH       Extra literal path Nextcloud must stay outside of. Repeatable.
+  --subnet-router    This node advertises subnet routes or is an exit node.
+  --allow-rootfs     Permit a --root that resolves to the OS filesystem.
+  --accept-low-ram   Proceed with less than 6 GiB of RAM.
+  --accept-ct-log    Acknowledge the permanent Certificate Transparency entry.
+  --install-docker   Opt in to installing docker and docker-compose with pacman.
+  --i-understand-kernel-risk
+                     Required with --install-docker.
+  --setup-zram       Configure zram, then exit. Run this first if the box has
+                     no swap; the preflight refuses to install without one.
+  -h, --help         Print this help.
+
+Examples:
+  nextcloud-preflight --root /mnt/array/nextcloud --accept-ct-log
+  nextcloud-install --root /mnt/array/nextcloud --tz Asia/Ho_Chi_Minh --accept-ct-log
+USAGE
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+  esac
+done
+
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  exec sudo -- "$0" "$@"
+fi
+
+step() {
+  printf '\n== %s ==\n' "$*"
+}
+
+need_value() {
+  [[ -n "${2:-}" ]] || die \
+    "checked that $1 was given a value" \
+    "$1 with no argument after it" \
+    "$1 followed by one value" \
+    "see nextcloud-install --help"
+}
+
+while (($#)); do
+  case "$1" in
+    --root)
+      need_value --root "${2:-}"
+      NC_ROOT=$2
+      shift
+      ;;
+    --port)
+      need_value --port "${2:-}"
+      NC_HTTP_PORT=$2
+      shift
+      ;;
+    --project)
+      need_value --project "${2:-}"
+      NC_PROJECT=$2
+      shift
+      ;;
+    --subnet)
+      need_value --subnet "${2:-}"
+      NC_SUBNET=$2
+      shift
+      ;;
+    --fqdn)
+      need_value --fqdn "${2:-}"
+      NC_FQDN=$2
+      shift
+      ;;
+    --tz)
+      need_value --tz "${2:-}"
+      NC_TZ=$2
+      shift
+      ;;
+    --admin-user)
+      need_value --admin-user "${2:-}"
+      NC_ADMIN_USER=$2
+      shift
+      ;;
+    --conf)
+      need_value --conf "${2:-}"
+      CNC_CONF=$2
+      shift
+      ;;
+    --guard)
+      need_value --guard "${2:-}"
+      GUARD_PATHS+=("$2")
+      shift
+      ;;
+    --subnet-router) SUBNET_ROUTER=1 ;;
+    --install-docker) INSTALL_DOCKER=1 ;;
+    --i-understand-kernel-risk) KERNEL_RISK=1 ;;
+    --setup-zram) SETUP_ZRAM=1 ;;
+    # Consumed by nextcloud-preflight, which receives "$@" untouched. Accepted
+    # here only so an unknown-option refusal cannot fire on a valid flag.
+    --allow-rootfs|--accept-low-ram|--accept-ct-log) ;;
+    *)
+      printf 'error: unknown option: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+# --setup-zram runs BEFORE the preflight by necessity: the preflight refuses to
+# install on a box with no swap, so a zram step gated behind it could never run.
+# It therefore carries its own identity guard and then stops, rather than
+# falling through into the install with the rest of the checks unperformed.
+identity_guard() {
+  local arch id tsip
+  arch=$(uname -m)
+  [[ "$arch" == x86_64 ]] || die \
+    'checked the machine architecture before touching this box' \
+    "uname -m reported $arch" \
+    'x86_64' \
+    'this installer is for x86_64 Arch Linux (ArchNAS); you are not on the box you think you are'
+  id=$(grep -E '^ID=' /etc/os-release 2>/dev/null || true)
+  case "$id" in
+    ID=arch) ;;
+    *) die \
+      'checked /etc/os-release for an Arch Linux installation' \
+      "found '${id:-no ID= line}'" \
+      'ID=arch' \
+      'this installer is for ArchNAS; run it on the right machine' ;;
+  esac
+  command -v tailscale >/dev/null 2>&1 || die \
+    'checked for the tailscale command' \
+    'tailscale is not installed' \
+    'tailscale present and tailscaled running' \
+    'this box is reachable only over the tailnet; refusing to touch it without tailscale'
+  tsip=$(tailscale ip -4 2>/dev/null || true)
+  tsip="${tsip%%$'\n'*}"
+  [[ "$tsip" == 100.113.121.58 ]] || die \
+    'checked the tailnet address to confirm this is ArchNAS' \
+    "tailscale ip -4 returned '${tsip:-nothing}'" \
+    '100.113.121.58' \
+    'this is not ArchNAS; aborting before anything is touched'
+  NC_TSIP="$tsip"
+}
+
+setup_zram() {
+  local mem_kb half_mib
+
+  identity_guard
+
+  [[ -z "$(swapon --show --noheadings 2>/dev/null || true)" ]] || die \
+    'checked for existing swap before writing a zram configuration' \
+    "swapon --show already reports: $(swapon --show --noheadings | tr '\n' ' ')" \
+    'no swap, because --setup-zram is only for a box that has none' \
+    'the box already has swap; drop --setup-zram and run the install'
+  [[ ! -e "$ZRAM_CONF" ]] || die \
+    "checked that $ZRAM_CONF does not already exist" \
+    'the file is already present' \
+    'no file, so that removing it at teardown cannot destroy configuration this installer did not write' \
+    "review $ZRAM_CONF by hand; if it is yours, keep it and re-run the install without --setup-zram"
+  [[ -x /usr/lib/systemd/system-generators/zram-generator ]] || die \
+    'checked for the systemd zram generator' \
+    '/usr/lib/systemd/system-generators/zram-generator is missing' \
+    'the zram-generator package installed' \
+    'install zram-generator with pacman, or add a swapfile by hand; this script will not run pacman for you here'
+
+  mem_kb=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)
+  half_mib=$(( mem_kb / 2048 ))
+  (( half_mib > 4096 )) && half_mib=4096
+
+  install -D -m 0644 /dev/null "$ZRAM_CONF"
+  cat >"$ZRAM_CONF" <<ZRAM
+# Written by nextcloud-install --setup-zram.
+[zram0]
+zram-size = ${half_mib}
+compression-algorithm = zstd
+ZRAM
+
+  systemctl daemon-reload
+  systemctl start systemd-zram-setup@zram0.service
+
+  note ''
+  note "wrote $ZRAM_CONF (zram0, ${half_mib} MiB, zstd) and started systemd-zram-setup@zram0.service"
+  swapon --show || true
+  note ''
+  note 'zram is configured. Now run the read-only preflight, then the install:'
+  note "  nextcloud-preflight --root <path> ..."
+  note "  nextcloud-install --root <path> ..."
+  note ''
+  note 'nextcloud-uninstall removes this file only when ZRAM_BY_US=1 is recorded,'
+  note 'which happens on the install run, not on this one. Remove it by hand if'
+  note 'you abandon the trial before installing.'
+}
+
+if (( SETUP_ZRAM )); then
+  setup_zram
+  exit 0
+fi
+
+step 'Preflight'
+command -v nextcloud-preflight >/dev/null 2>&1 || die \
+  'checked for nextcloud-preflight, which must pass before anything is changed' \
+  'nextcloud-preflight is not on PATH' \
+  'nextcloud-preflight installed in /usr/local/bin' \
+  'run ./scripts/install.sh from the asustor-nas-control checkout, then re-run this'
+
+nextcloud-preflight "$@" || exit 1
+
+step 'Discovery'
+
+identity_guard
+
+NC_OWNER="${SUDO_USER:-}"
+[[ -n "$NC_OWNER" ]] || die \
+  'checked SUDO_USER after the sudo re-exec to identify the box owner' \
+  'SUDO_USER is empty, so this was invoked directly as root' \
+  "the owner's username, so the owner home, cloud-nas.conf and the user systemd bus can be located" \
+  'run this as your normal user - the script re-execs itself through sudo'
+NC_OWNER_HOME=$(getent passwd "$NC_OWNER" 2>/dev/null | cut -d: -f6 || true)
+NC_OWNER_UID=$(getent passwd "$NC_OWNER" 2>/dev/null | cut -d: -f3 || true)
+[[ -d "$NC_OWNER_HOME" ]] || die \
+  "checked that the owner home directory for $NC_OWNER exists" \
+  "getent passwd gave '${NC_OWNER_HOME:-nothing}'" \
+  'an existing directory' \
+  "fix $NC_OWNER's passwd entry, or run as the user that owns the cloud-nas pipeline"
+[[ "$NC_OWNER_UID" =~ ^[0-9]+$ ]] || die \
+  "checked that $NC_OWNER has a numeric uid" \
+  "getent passwd gave '${NC_OWNER_UID:-nothing}'" \
+  'a numeric uid, needed to reach the owner systemd user manager' \
+  "fix $NC_OWNER's passwd entry before continuing"
+
+if [[ -z "$NC_ROOT" ]]; then
+  printf '\nthe ten largest filesystems on this box:\n' >&2
+  findmnt -n -o TARGET,FSTYPE,AVAIL --list 2>/dev/null | sort -k3 -h -r | head -n 10 >&2 || true
+  printf '\n' >&2
+  die \
+    'checked that --root was supplied' \
+    'no --root on the command line' \
+    'an absolute path on the array for the Nextcloud tree' \
+    'there is no default and this script will not guess; pick one of the filesystems listed above'
+fi
+[[ "$NC_ROOT" == /?* ]] || die \
+  'checked that --root is an absolute path below the root directory' \
+  "--root '$NC_ROOT'" \
+  'an absolute path that is not /' \
+  'pass a path like --root /mnt/array/nextcloud'
+NC_ROOT="${NC_ROOT%/}"
+
+# A colon would split the compose bind-mount syntax; the rest would either be
+# re-expanded by Compose or truncate the .env line at a comment.
+case "$NC_ROOT" in
+  *'$'* | *'`'* | *'"'* | *'#'* | *:* | *$'\n'*)
+    die \
+      'checked --root for characters that Compose or the .env parser would reinterpret' \
+      "--root '$NC_ROOT'" \
+      'a path with no $, backtick, double quote, hash, colon or newline' \
+      'choose a plainer path on the array; a colon in particular splits the bind-mount source from its target'
+    ;;
+esac
+
+if ! [[ "$NC_HTTP_PORT" =~ ^[0-9]+$ ]] || (( NC_HTTP_PORT < 1 || NC_HTTP_PORT > 65535 )); then
+  die \
+    'checked that --port is a usable TCP port' \
+    "--port '$NC_HTTP_PORT'" \
+    'an integer between 1 and 65535' \
+    'pass --port 8080 or another free port'
+fi
+[[ "$NC_PROJECT" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || die \
+  'checked that --project is a legal Compose project name' \
+  "--project '$NC_PROJECT'" \
+  'lowercase letters, digits, underscore and dash, starting with a letter or digit' \
+  'pass --project nextcloud-trial or another name matching that pattern'
+[[ "$NC_ADMIN_USER" =~ ^[A-Za-z0-9_.@-]+$ ]] || die \
+  'checked that --admin-user is a plain account name' \
+  "--admin-user '$NC_ADMIN_USER'" \
+  'letters, digits and _ . @ - only' \
+  'pass a simpler --admin-user; the value is written into .env and read by Compose'
+
+if [[ -z "$NC_TZ" ]]; then
+  NC_TZ=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+  [[ -n "$NC_TZ" ]] || NC_TZ=UTC
+fi
+[[ "$NC_TZ" =~ ^[A-Za-z0-9/_+-]+$ && -e "/usr/share/zoneinfo/$NC_TZ" ]] || die \
+  'checked that the container timezone names a real zoneinfo entry' \
+  "--tz '$NC_TZ'" \
+  'a zone present under /usr/share/zoneinfo, for example Asia/Ho_Chi_Minh' \
+  'pass --tz with a valid zone name'
+
+mem_kb=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)
+[[ "$mem_kb" =~ ^[0-9]+$ ]] || die \
+  'checked MemTotal in /proc/meminfo to select a memory profile' \
+  "read '${mem_kb:-nothing}'" \
+  'an integer number of kilobytes' \
+  '/proc/meminfo is unreadable or unusual; this box cannot be profiled and the caps are the only thing keeping Nextcloud away from the rclone sync'
+
+# The spec defines profiles at "under 6 GiB" and "8 GiB or more". The high
+# profile's caps sum to about 5 GiB, so the undefined 6-8 GiB band takes the
+# low profile rather than a set of limits larger than the machine.
+if (( mem_kb < 8 * 1024 * 1024 )); then
+  RAM_PROFILE=low
+  APP_MEM=1280m
+  DB_MEM=512m
+  REDIS_MEM=128m
+  CRON_MEM=512m
+  DB_SHARED_BUFFERS=128MB
+  MPM_MAX_WORKERS=8
+else
+  RAM_PROFILE=high
+  APP_MEM=3g
+  DB_MEM=1g
+  REDIS_MEM=256m
+  CRON_MEM=768m
+  DB_SHARED_BUFFERS=256MB
+  MPM_MAX_WORKERS=24
+fi
+PHP_MEMORY_LIMIT=512M
+PHP_UPLOAD_LIMIT=16G
+
+BASELINE_DIR=''
+for d in "$NCT_STATE"/baseline-*; do
+  [[ -d "$d" ]] || continue
+  BASELINE_DIR="$d"
+done
+[[ -n "$BASELINE_DIR" ]] || warn "no baseline directory under $NCT_STATE; nextcloud-postflight will have nothing to diff against"
+
+note "owner:        $NC_OWNER (uid $NC_OWNER_UID, home $NC_OWNER_HOME)"
+note "tailnet ip:   $NC_TSIP"
+note "root:         $NC_ROOT"
+note "mountpoint:   $(mnt_of "$NC_ROOT" || printf unknown) fstype=$(fstype_of "$NC_ROOT" || printf unknown) source=$(src_of "$NC_ROOT" || printf unknown)"
+note "free:         $(free_bytes "$NC_ROOT" || printf unknown) bytes, $(used_pct "$NC_ROOT" || printf '?')% used"
+note "project:      $NC_PROJECT"
+note "port:         127.0.0.1:$NC_HTTP_PORT"
+note "timezone:     $NC_TZ"
+note "memory:       $(( mem_kb / 1024 )) MiB total -> $RAM_PROFILE profile (app $APP_MEM, db $DB_MEM, redis $REDIS_MEM, cron $CRON_MEM, MaxRequestWorkers $MPM_MAX_WORKERS)"
+note "baseline:     ${BASELINE_DIR:-none}"
+
+step 'Containment guards'
+
+[[ -n "$CNC_CONF" ]] || CNC_CONF="$NC_OWNER_HOME/.config/cloud-nas/cloud-nas.conf"
+
+# cnc_get calls die on an unsafe value, but die's exit 1 inside $() leaves only
+# the subshell, which reads identically to "key absent". The key is therefore
+# proven present first, so that any failure afterwards can only be the refusal.
+conf_has_key() {
+  [[ -r "$CNC_CONF" ]] || return 1
+  grep -qE "^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*=" -- "$CNC_CONF" 2>/dev/null
+}
+
+if [[ -r "$CNC_CONF" ]]; then
+  note "cloud-nas config: $CNC_CONF (parsed with grep, never sourced)"
+  for key in NAS02_MOUNT NAS03_MOUNT NAS03_TARGET NAS02_BACKUP_ROOT CLOUD_NAS_STATE_DIR; do
+    conf_has_key "$key" || continue
+    value=$(cnc_get "$CNC_CONF" "$key" "$NC_OWNER_HOME") || die \
+      "read $key out of $CNC_CONF to build the rclone containment guard" \
+      "the key is present but could not be resolved to a literal path" \
+      'a literal path with no unresolved shell expansion' \
+      "pass the resolved path explicitly with --guard /mnt/... ; a guard that cannot be evaluated must never read as a pass"
+    [[ -n "$value" ]] || continue
+    GUARD_PATHS+=("$value")
+    note "  guard $key = $value"
+  done
+else
+  # An unreadable config is not evidence that the pipeline is absent, and
+  # guessing its paths is how Nextcloud data ends up inside the rclone mirror.
+  found=()
+  for cmd in cloud-nas-lib cloud-nas-sync cloud-nas-backup-to-nas02; do
+    [[ -e "$NC_OWNER_HOME/.local/bin/$cmd" ]] && found+=("$NC_OWNER_HOME/.local/bin/$cmd")
+  done
+  units=$(run_user_systemctl list-unit-files 'cloud-nas*' --no-legend 2>/dev/null || true)
+  if (( ${#found[@]} )) || [[ -n "$units" ]]; then
+    die \
+      "looked for a readable cloud-nas config at $CNC_CONF after finding the pipeline itself" \
+      "no readable config, but found: ${found[*]:-} ${units:+plus cloud-nas user units}" \
+      'a readable cloud-nas.conf, or explicit --conf / --guard arguments' \
+      'pass --conf /path/to/cloud-nas.conf, or name every rclone-managed directory with repeated --guard arguments'
+  fi
+  warn "no cloud-nas config at $CNC_CONF and no cloud-nas commands or user units found"
+  warn 'if the rclone pipeline should be on this box, this is not the machine you think it is - stop'
+fi
+
+assert_outside_pipeline() {
+  local target=$1 label=$2 p
+  (( ${#GUARD_PATHS[@]} )) || return 0
+  for p in "${GUARD_PATHS[@]}"; do
+    if path_is_within "$target" "$p"; then
+      die \
+        "tested whether $label is inside the rclone-managed path $p" \
+        "$label = $target, which is at or below $p" \
+        "a path outside every cloud-nas volume" \
+        "rclone sync would either delete Nextcloud's files as drift or mirror its appdata and previews up to Google Drive and OneDrive; choose a location outside $p"
+    fi
+    if path_is_within "$p" "$target"; then
+      die \
+        "tested whether the rclone-managed path $p is inside $label" \
+        "$p is at or below $label = $target" \
+        "$label to contain nothing but Nextcloud" \
+        "choose a --root that does not contain any cloud-nas volume"
+    fi
+  done
+}
+
+assert_outside_pipeline "$NC_ROOT" 'NC_ROOT'
+assert_outside_pipeline /var/lib/docker '/var/lib/docker'
+assert_outside_pipeline /var/lib/containerd '/var/lib/containerd'
+note 'NC_ROOT, /var/lib/docker and /var/lib/containerd are outside every guard, in both directions'
+
+# Rewritten after every step that changes host state, because nextcloud-uninstall
+# is a separate process that can see nothing but this file - and a run that dies
+# halfway must still leave behind an accurate list of what to undo.
+write_conf() {
+  install -d -m 0755 -- "$NCT_ETC"
+  install -D -m 0600 /dev/null -- "$NCT_CONF"
+  {
+    printf '# Written by nextcloud-install. Sourced by nextcloud-lib require_conf.\n'
+    printf '# Root-owned, mode 0600: anyone who can write this runs code as root.\n'
+    printf 'NC_ROOT=%q\n' "$NC_ROOT"
+    printf 'NC_PROJECT=%q\n' "$NC_PROJECT"
+    printf 'NC_OWNER=%q\n' "$NC_OWNER"
+    printf 'NC_OWNER_HOME=%q\n' "$NC_OWNER_HOME"
+    printf 'NC_OWNER_UID=%q\n' "$NC_OWNER_UID"
+    printf 'NC_HTTP_PORT=%q\n' "$NC_HTTP_PORT"
+    printf 'NC_SUBNET=%q\n' "$NC_SUBNET"
+    printf 'NC_FQDN=%q\n' "$NC_FQDN"
+    printf 'NC_TSIP=%q\n' "$NC_TSIP"
+    printf 'NC_IMAGE=%q\n' "$NC_IMAGE"
+    printf 'DB_IMAGE=%q\n' "$DB_IMAGE"
+    printf 'REDIS_IMAGE=%q\n' "$REDIS_IMAGE"
+    printf 'RAM_PROFILE=%q\n' "$RAM_PROFILE"
+    printf 'BASELINE_DIR=%q\n' "$BASELINE_DIR"
+    printf 'DOCKER_ENABLED_BY_US=%q\n' "$DOCKER_ENABLED_BY_US"
+    printf 'TS_SERVE_SET_BY_US=%q\n' "$TS_SERVE_SET_BY_US"
+    printf 'ZRAM_BY_US=%q\n' "$ZRAM_BY_US"
+    printf 'SYSCTL_BY_US=%q\n' "$SYSCTL_BY_US"
+    printf 'OOMADJ_BY_US=%q\n' "$OOMADJ_BY_US"
+    printf '# Not in the nextcloud-lib default list, but nextcloud-uninstall needs\n'
+    printf '# both to run pg_dump before it destroys the database volume.\n'
+    printf 'POSTGRES_DB=%q\n' "$POSTGRES_DB"
+    printf 'POSTGRES_USER=%q\n' "$POSTGRES_USER"
+  } >"$NCT_CONF"
+  chown root:root -- "$NCT_CONF"
+  chmod 0600 -- "$NCT_CONF"
+}
+
+step '1/14  Installer state file'
+write_conf
+note "wrote $NCT_CONF (root:root, mode 0600)"
+
+step '2/14  IP forwarding for subnet routing'
+if (( SUBNET_ROUTER )); then
+  if [[ -e "$SYSCTL_FILE" ]]; then
+    cp -a -- "$SYSCTL_FILE" "${SYSCTL_FILE}.pre-nextcloud-trial.bak"
+    warn "$SYSCTL_FILE already existed; kept a copy at ${SYSCTL_FILE}.pre-nextcloud-trial.bak"
+  fi
+  install -D -m 0644 /dev/null -- "$SYSCTL_FILE"
+  cat >"$SYSCTL_FILE" <<'SYSCTL'
+# Written by nextcloud-install because this node advertises Tailscale subnet
+# routes. Docker sets the FORWARD policy to drop only if forwarding was not
+# already enabled when it started, so enabling it first keeps routing intact.
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+SYSCTL
+  sysctl --system >/dev/null
+  SYSCTL_BY_US=1
+  write_conf
+  note "wrote $SYSCTL_FILE and applied it with sysctl --system, before Docker's first start"
+  note "  net.ipv4.ip_forward = $(sysctl -n net.ipv4.ip_forward)"
+  note "  net.ipv6.conf.all.forwarding = $(sysctl -n net.ipv6.conf.all.forwarding)"
+else
+  note 'skipped: --subnet-router was not given, so this node is treated as neither a subnet router nor an exit node'
+  note 'if that is wrong, tear down and re-run with --subnet-router before Docker ever starts'
+fi
+
+step '3/14  tailscaled OOM protection'
+if [[ -e "$OOM_DROPIN" ]]; then
+  warn "$OOM_DROPIN already exists; leaving it alone and not claiming it at teardown"
+else
+  install -d -m 0755 -- "$OOM_DROPIN_DIR"
+  install -D -m 0644 /dev/null -- "$OOM_DROPIN"
+  cat >"$OOM_DROPIN" <<'OOMADJ'
+# Written by nextcloud-install. On 4 GB an OOM event can select tailscaled, and
+# a headless tailnet-only NAS that loses tailscaled needs physical access.
+[Service]
+OOMScoreAdjust=-900
+OOMADJ
+  systemctl daemon-reload
+  OOMADJ_BY_US=1
+  write_conf
+  note "wrote $OOM_DROPIN and ran systemctl daemon-reload"
+  note 'tailscaled is NOT restarted: restarting it over its own tunnel drops this SSH session'
+  note 'OOMScoreAdjust=-900 therefore takes effect at the next boot, not now'
+fi
+
+step '4/14  Docker'
+
+pacman_install_docker() {
+  local list reply
+
+  [[ -t 0 ]] || die \
+    'checked for an interactive terminal before asking for consent to a pacman transaction' \
+    'stdin is not a terminal' \
+    'an interactive shell inside tmux or screen' \
+    'run this by hand over SSH inside tmux; never from a pipe, a cron job or a unit'
+  (( KERNEL_RISK )) || die \
+    'checked for --i-understand-kernel-risk, which --install-docker requires' \
+    '--install-docker without --i-understand-kernel-risk' \
+    'both flags together' \
+    'pacman -S docker alone is an unsupported partial upgrade on Arch, so this runs pacman -Syu, which can pull a new kernel; add --i-understand-kernel-risk once you have read what that means for the asustor modules'
+  # shellcheck disable=SC2016  # the names are quoted text in a refusal, not expansions
+  [[ -n "${TMUX:-}${STY:-}" ]] || die \
+    'checked for tmux or screen before running pacman' \
+    'neither $TMUX nor $STY is set' \
+    'a tmux or screen session' \
+    'pacman -Syu can restart tailscaled and kill the SSH session you are standing on, leaving a partial transaction and a stale /var/lib/pacman/db.lck on a headless box; run inside tmux or screen'
+  [[ ! -e /var/lib/pacman/db.lck ]] || die \
+    'checked for a pacman database lock' \
+    '/var/lib/pacman/db.lck exists' \
+    'no lock file' \
+    'another transaction is running or a previous one died; resolve it before continuing'
+
+  list=$(pacman -Syup --print-format '%n %v' 2>/dev/null || true)
+  printf '\npending pacman transaction (%s packages):\n' "$(printf '%s\n' "$list" | grep -c . || true)"
+  printf '%s\n\n' "$list"
+  printf 'This can upgrade the kernel, systemd (triggering daemon-reexec), openssh\n'
+  printf 'and tailscale in one shot. Read the list above.\n\n'
+
+  # Not gated on the word "linux" alone: the whole list is shown and consented
+  # to, and the kernel test below is a second, independent gate.
+  if printf '%s\n' "$list" | grep -qE '^linux(-lts|-zen|-hardened)? '; then
+    if dkms status 2>/dev/null | grep -q asustor; then
+      warn 'the transaction upgrades the kernel, but the asustor modules are DKMS-managed and will be rebuilt'
+    elif pacman -Qo "$(modinfo -n asustor 2>/dev/null || printf /nonexistent)" >/dev/null 2>&1; then
+      warn 'the transaction upgrades the kernel, but a package owns the asustor module file'
+    else
+      # shellcheck disable=SC2016  # the backticks are quoted text in a refusal
+      die \
+        'checked whether the asustor platform modules survive the kernel upgrade in this transaction' \
+        'the transaction contains a kernel package and the modules are neither DKMS-managed nor owned by a package' \
+        'DKMS-managed asustor modules, or a transaction with no kernel change' \
+        'run `sudo make dkms` in your asustor-platform-driver checkout FIRST; otherwise the next reboot loses fan, LED and hwmon control on a box you cannot physically reach'
+    fi
+  fi
+
+  printf 'Type exactly INSTALL DOCKER to proceed, anything else to abort: '
+  IFS= read -r reply || reply=''
+  [[ "$reply" == 'INSTALL DOCKER' ]] || die \
+    'asked for typed consent before running pacman -Syu' \
+    "read '${reply}'" \
+    'the exact string INSTALL DOCKER' \
+    'nothing was changed; re-run when you are ready to review the transaction again'
+
+  pacman -Syu --needed docker docker-compose
+  note 'installed docker and docker-compose; nobody was added to the docker group, deliberately'
+}
+
+if ! command -v docker >/dev/null 2>&1; then
+  if (( INSTALL_DOCKER )); then
+    pacman_install_docker
+  else
+    die \
+      'checked for the docker command before starting the container runtime' \
+      'docker is not installed on this box' \
+      'docker and docker-compose from the Arch extra repository' \
+      'package install is not part of the default path; re-run inside tmux as: nextcloud-install --install-docker --i-understand-kernel-risk ... and read the transaction list it prints'
+  fi
+elif (( INSTALL_DOCKER )); then
+  note 'docker is already installed; --install-docker is a no-op and pacman will not be run'
+fi
+
+command -v docker >/dev/null 2>&1 || die \
+  'checked for the docker command after the package step' \
+  'docker is still not on PATH' \
+  'a working docker CLI' \
+  'the pacman transaction did not provide it; investigate before re-running'
+
+docker_was_enabled=$(systemctl is-enabled docker.service 2>/dev/null || true)
+docker_was_active=$(systemctl is-active docker.service 2>/dev/null || true)
+if [[ "$docker_was_enabled" == enabled && "$docker_was_active" == active ]]; then
+  note 'docker.service was already enabled and active; leaving it alone and not claiming it at teardown'
+else
+  # docker.service, not docker.socket alone: with only the socket enabled dockerd
+  # starts on first client use rather than at boot, so restart:unless-stopped
+  # containers do not come back after an unattended reboot.
+  systemctl enable --now docker.service
+  DOCKER_ENABLED_BY_US=1
+  write_conf
+  note "enabled and started docker.service (was enabled=${docker_was_enabled:-unknown} active=${docker_was_active:-unknown})"
+fi
+
+for i in $(seq 1 30); do
+  docker info >/dev/null 2>&1 && break
+  sleep 2
+done
+docker info >/dev/null 2>&1 || die \
+  'waited 60 seconds for the Docker daemon to answer' \
+  'docker info still fails' \
+  'a responsive dockerd' \
+  'check: systemctl status docker.service and journalctl -u docker.service -n 50'
+
+docker compose version >/dev/null 2>&1 || die \
+  'checked that the docker compose plugin is available' \
+  'docker compose version failed' \
+  'the docker-compose package, which installs /usr/lib/docker/cli-plugins/docker-compose' \
+  'install docker-compose from the Arch extra repository; the standalone docker-compose binary is not used by these scripts'
+
+docker_info=$(docker info 2>&1 || true)
+case "$docker_info" in
+  *'No memory limit support'*)
+    die \
+      'read the Docker daemon warnings for cgroup memory limit support' \
+      "docker info reports 'No memory limit support'" \
+      'a kernel with the cgroup memory controller available to Docker' \
+      'mem_limit would be accepted and silently NOT enforced, which removes the only mechanism keeping a Nextcloud spike from OOM-killing the rclone sync; refusing'
+    ;;
+esac
+note "docker: $(docker info --format '{{.Driver}} root={{.DockerRootDir}} cgroup={{.CgroupDriver}}/{{.CgroupVersion}}' 2>/dev/null || printf unknown)"
+
+step '5/14  Image tags resolve'
+for tag in "$NC_IMAGE" "$DB_IMAGE" "$REDIS_IMAGE"; do
+  docker manifest inspect "$tag" >/dev/null 2>&1 || die \
+    "resolved the image tag $tag against the registry, before creating any directory" \
+    "docker manifest inspect $tag failed" \
+    'a tag that exists and a reachable registry' \
+    "either the registry is unreachable from this box or the tag is wrong; redis:8-alpine in particular was never independently verified and its documented fallback is redis:7-alpine - edit REDIS_IMAGE near the top of $0 if that is the failing tag"
+  note "  $tag resolves"
+done
+
+step 'Bridge subnet'
+
+subnet_in_use() {
+  local cidr=$1 routes nets
+  routes=$(ip route show 2>/dev/null || true)
+  case "$routes" in *"$cidr"*) return 0 ;; esac
+  nets=$(docker network ls -q 2>/dev/null | xargs -r docker network inspect -f '{{range .IPAM.Config}}{{println .Subnet}}{{end}}' 2>/dev/null || true)
+  case "$nets" in *"$cidr"*) return 0 ;; esac
+  return 1
+}
+
+if [[ -n "$NC_SUBNET" ]]; then
+  [[ "$NC_SUBNET" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || die \
+    'checked that --subnet is a CIDR block' \
+    "--subnet '$NC_SUBNET'" \
+    'a dotted-quad CIDR such as 172.31.240.0/24' \
+    'pass --subnet 172.31.240.0/24 or omit it and let this script pick a free candidate'
+  case "$NC_SUBNET" in
+    172.17.*)
+      die \
+        "checked --subnet against Docker's default bridge pool" \
+        "--subnet '$NC_SUBNET' is inside 172.17.0.0/16" \
+        'a block outside the default bridge network' \
+        'choose another CIDR; this value is used verbatim as TRUSTED_PROXIES and must not collide with docker0'
+      ;;
+  esac
+  ! subnet_in_use "$NC_SUBNET" || die \
+    'checked whether the requested bridge subnet is already routed or already used by a Docker network' \
+    "$NC_SUBNET appears in ip route or in an existing network's IPAM config" \
+    'a subnet in use by nothing else' \
+    'pass a different --subnet'
+  note "using the supplied bridge subnet $NC_SUBNET"
+else
+  for candidate in 172.31.240.0/24 172.31.241.0/24 10.201.7.0/24; do
+    if ! subnet_in_use "$candidate"; then
+      NC_SUBNET="$candidate"
+      break
+    fi
+    note "  $candidate is already in use"
+  done
+  [[ -n "$NC_SUBNET" ]] || die \
+    'looked for a free bridge subnet among the three documented candidates' \
+    'all of 172.31.240.0/24, 172.31.241.0/24 and 10.201.7.0/24 are already routed or already used by a Docker network' \
+    'one free candidate block' \
+    'pass --subnet <CIDR> naming a block this box does not already route'
+  note "picked bridge subnet $NC_SUBNET (pinned in compose.yaml and used verbatim as TRUSTED_PROXIES)"
+fi
+write_conf
+
+step '6/14  Tailscale serve'
+
+# Configured before any container exists, so the FQDN and the certificate are
+# proven while nothing depends on them. There is deliberately NO retry here:
+# Tailscale documents that repeatedly requesting a certificate can exceed Let's
+# Encrypt's rate limits and leave you waiting 34 hours.
+tailscale serve --bg --https=443 "http://127.0.0.1:${NC_HTTP_PORT}" || die \
+  "asked tailscale to serve https://<this node>/ from http://127.0.0.1:${NC_HTTP_PORT}" \
+  'tailscale serve --bg --https=443 failed' \
+  'a serve handler on :443 and a provisioned tailnet certificate' \
+  'read the error above and fix it by hand; this script will NOT retry, because repeated certificate requests trip Let'"'"'s Encrypt rate limits for 34 hours'
+TS_SERVE_SET_BY_US=1
+write_conf
+
+derive_fqdn() {
+  local out line host
+  if command -v jq >/dev/null 2>&1; then
+    host=$(tailscale status --json 2>/dev/null | jq -r '.CertDomains[0] // empty' 2>/dev/null || true)
+    if [[ -n "$host" ]]; then
+      printf '%s\n' "$host"
+      return 0
+    fi
+  fi
+  out=$(tailscale serve status 2>/dev/null || true)
+  while IFS= read -r line; do
+    case "$line" in
+      https://*)
+        host="${line#https://}"
+        host="${host%%[[:space:]]*}"
+        host="${host%%/*}"
+        [[ -n "$host" ]] || continue
+        printf '%s\n' "$host"
+        return 0
+        ;;
+    esac
+  done <<<"$out"
+  return 1
+}
+
+if [[ -n "$NC_FQDN" ]]; then
+  note "using the supplied FQDN $NC_FQDN"
+else
+  NC_FQDN=$(derive_fqdn || true)
+  # shellcheck disable=SC2016  # the backticks are quoted text in a refusal
+  [[ -n "$NC_FQDN" ]] || die \
+    'read the tailnet FQDN back from tailscale after configuring serve' \
+    'neither jq on tailscale status --json nor the text of tailscale serve status produced a hostname' \
+    'the FQDN this node serves, for example archnas.<tailnet>.ts.net' \
+    'run `tailscale serve status`, read the https:// line, and re-run with --fqdn <name>; never hardcode a guess, because a wrong value produces an untrusted-domain lockout that then needs occ to unpick'
+fi
+
+[[ "$NC_FQDN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || die \
+  'checked that the tailnet FQDN is a plain hostname' \
+  "FQDN '$NC_FQDN'" \
+  'letters, digits, dots and dashes only' \
+  'pass a clean --fqdn; this value is written into .env, into trusted_domains and into every printed URL'
+
+resolved=$(getent ahostsv4 "$NC_FQDN" 2>/dev/null || true)
+resolved="${resolved%%$'\n'*}"
+resolved="${resolved%% *}"
+[[ "$resolved" == "$NC_TSIP" ]] || die \
+  'resolved the derived FQDN and compared it with this node tailnet address' \
+  "getent ahostsv4 $NC_FQDN gave '${resolved:-nothing}', tailscale ip -4 gave $NC_TSIP" \
+  'the two to be the same address' \
+  'MagicDNS is off, or the FQDN belongs to another node; fix DNS or pass the correct --fqdn before anything is written that depends on it'
+
+write_conf
+note "FQDN:  $NC_FQDN  ->  $resolved"
+note "serve: https://${NC_FQDN}/  ->  http://127.0.0.1:${NC_HTTP_PORT}"
+tailscale serve status || true
+
+step '7/14  Create the tree'
+
+MARKER="$NC_ROOT/.nextcloud-trial-owned"
+nc_fstype=$(fstype_of "$NC_ROOT" || printf unknown)
+note "filesystem holding $NC_ROOT: $nc_fstype"
+
+if [[ -e "$MARKER" ]]; then
+  note "$MARKER already exists; adopting the tree this installer created earlier"
+elif [[ -d "$NC_ROOT" ]] && [[ -n "$(ls -A -- "$NC_ROOT" 2>/dev/null || true)" ]]; then
+  die \
+    "checked whether $NC_ROOT is empty or carries this installer's marker" \
+    "the directory is non-empty and has no $MARKER" \
+    'an empty path, or one this installer created' \
+    'this installer will not adopt data it did not create; choose a fresh --root'
+else
+  case "$nc_fstype" in
+    btrfs)
+      command -v btrfs >/dev/null 2>&1 || die \
+        'checked for btrfs-progs before creating NC_ROOT as a subvolume' \
+        'the btrfs command is missing' \
+        'btrfs-progs installed' \
+        'install btrfs-progs, or pass a --root on a filesystem that does not need one'
+      # Created as a subvolume BEFORE anything is written inside it: btrfs
+      # subvolume create fails on an existing path, and a plain directory would
+      # leave the uninstaller's btrfs subvolume delete operating on the wrong
+      # kind of object.
+      if [[ -d "$NC_ROOT" ]]; then
+        rmdir -- "$NC_ROOT" 2>/dev/null || true
+      fi
+      if [[ -d "$NC_ROOT" ]]; then
+        warn "$NC_ROOT exists and could not be removed; using it as a plain directory, not a subvolume"
+      else
+        btrfs subvolume create -- "$NC_ROOT" >/dev/null || die \
+          "created $NC_ROOT as a btrfs subvolume" \
+          'btrfs subvolume create failed' \
+          'a new subvolume at that path' \
+          'read the error above; the parent may itself not be a btrfs mount, or the path may already exist'
+        chmod 0755 -- "$NC_ROOT"
+        note "created $NC_ROOT as a btrfs subvolume"
+      fi
+      ;;
+    zfs)
+      zfs_mnt=$(mnt_of "$NC_ROOT" || printf '')
+      [[ "$zfs_mnt" == "$NC_ROOT" ]] || die \
+        "checked for a ZFS dataset already mounted at $NC_ROOT" \
+        "the nearest mountpoint is '${zfs_mnt:-unknown}', not $NC_ROOT" \
+        'an existing dataset whose mountpoint is exactly NC_ROOT' \
+        "this installer does not create ZFS datasets; run zfs create -o mountpoint=$NC_ROOT <pool>/<dataset> yourself, then re-run"
+      note "using the existing ZFS dataset mounted at $NC_ROOT"
+      ;;
+    *)
+      install -d -m 0755 -- "$NC_ROOT"
+      note "created $NC_ROOT as a plain directory on $nc_fstype"
+      ;;
+  esac
+fi
+
+[[ -d "$NC_ROOT" ]] || die \
+  "checked that $NC_ROOT is a directory after creating it" \
+  'it is missing or is not a directory' \
+  'a directory this installer owns' \
+  'read the errors above; nothing further will be written'
+
+install -d -m 0755 -- "$NC_ROOT/conf"
+install -d -m 0755 -- "$NC_ROOT/data"
+printf 'project=%s\ncreated=%s\nby=nextcloud-install\n' \
+  "$NC_PROJECT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$MARKER"
+chmod 0644 -- "$MARKER"
+note "wrote $MARKER - nextcloud-uninstall refuses to delete a tree without it"
+
+step '8/14  Image uid probe, ownership and writability'
+
+# Never hardcoded: 33 is right for the Debian apache variants and 82 on Alpine,
+# and the wrong answer means a Nextcloud that cannot write its own data.
+www_uid=$(docker run --rm --entrypoint id "$NC_IMAGE" -u www-data 2>/dev/null || true)
+www_gid=$(docker run --rm --entrypoint id "$NC_IMAGE" -g www-data 2>/dev/null || true)
+[[ "$www_uid" =~ ^[0-9]+$ ]] || die \
+  "probed the image for the numeric uid of www-data" \
+  "docker run --rm --entrypoint id $NC_IMAGE -u www-data returned '${www_uid:-nothing}'" \
+  'a bare integer' \
+  'nothing has been chowned; do NOT hardcode 33, investigate why the probe failed and re-run'
+[[ "$www_gid" =~ ^[0-9]+$ ]] || die \
+  "probed the image for the numeric gid of www-data" \
+  "docker run --rm --entrypoint id $NC_IMAGE -g www-data returned '${www_gid:-nothing}'" \
+  'a bare integer' \
+  'nothing has been chowned; investigate why the probe failed and re-run'
+
+chown -- "$www_uid:$www_gid" "$NC_ROOT/data"
+chmod 0750 -- "$NC_ROOT/data"
+note "chowned only $NC_ROOT/data to ${www_uid}:${www_gid}, mode 0750"
+
+# --entrypoint sh deliberately, so no installation logic runs against a
+# half-built tree just to answer a permissions question.
+docker run --rm --entrypoint sh -u "$www_uid:$www_gid" \
+  -v "$NC_ROOT/data:/probe" "$NC_IMAGE" \
+  -c 'touch /probe/.wtest && rm -f /probe/.wtest' >/dev/null 2>&1 || die \
+  "proved that uid $www_uid can write $NC_ROOT/data from inside the image" \
+  'the touch/rm probe failed' \
+  'a writable bind mount' \
+  "fix ownership before the stack is created; the alternative is the Nextcloud installer failing with a data-directory error after the images have been pulled"
+note 'bind mount is writable by the image uid'
+
+if docker run --rm --entrypoint sh "$NC_IMAGE" -c 'test -x /cron.sh' >/dev/null 2>&1; then
+  CRON_OK=1
+  note '/cron.sh is present in this image tag; the cron sidecar will be included'
+else
+  CRON_OK=0
+  warn '/cron.sh not found in this image tag; omitting the cron sidecar and leaving Nextcloud in AJAX cron mode'
+  warn 'no host systemd timer is invented in its place - that would be residue the uninstaller has to chase'
+fi
+
+step '9/14  Compose project files'
+
+POSTGRES_PASSWORD=$(gen_secret)
+REDIS_HOST_PASSWORD=$(gen_secret)
+NC_ADMIN_PASSWORD=$(gen_secret)
+
+install -D -m 0600 /dev/null -- "$NC_ROOT/.env"
+cat >"$NC_ROOT/.env" <<ENV
+# Written by nextcloud-install. Mode 0600: this file holds the database, redis
+# and Nextcloud admin passwords in plain text. Compose reads it for the
+# \${VAR:?} references in compose.yaml.
+NC_PROJECT=$NC_PROJECT
+NC_ROOT=$NC_ROOT
+NC_HTTP_PORT=$NC_HTTP_PORT
+NC_SUBNET=$NC_SUBNET
+NC_FQDN=$NC_FQDN
+NC_TZ=$NC_TZ
+NC_IMAGE=$NC_IMAGE
+DB_IMAGE=$DB_IMAGE
+REDIS_IMAGE=$REDIS_IMAGE
+APP_MEM=$APP_MEM
+DB_MEM=$DB_MEM
+REDIS_MEM=$REDIS_MEM
+CRON_MEM=$CRON_MEM
+DB_SHARED_BUFFERS=$DB_SHARED_BUFFERS
+PHP_MEMORY_LIMIT=$PHP_MEMORY_LIMIT
+PHP_UPLOAD_LIMIT=$PHP_UPLOAD_LIMIT
+POSTGRES_DB=$POSTGRES_DB
+POSTGRES_USER=$POSTGRES_USER
+POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+REDIS_HOST_PASSWORD=$REDIS_HOST_PASSWORD
+NEXTCLOUD_ADMIN_USER=$NC_ADMIN_USER
+NEXTCLOUD_ADMIN_PASSWORD=$NC_ADMIN_PASSWORD
+ENV
+chmod 0600 -- "$NC_ROOT/.env"
+note "wrote $NC_ROOT/.env (mode 0600)"
+
+{
+  cat <<'COMPOSE_HEAD'
+# Written by nextcloud-install. Every value comes from .env beside this file;
+# the :? guards make Compose name a missing variable instead of substituting
+# empty. No user: key on app or cron: the official image's entrypoint must start
+# as root to fix permissions and bind port 80 before dropping to www-data.
+name: ${NC_PROJECT:?}
+
+services:
+  app:
+    image: ${NC_IMAGE:?}
+    container_name: nc-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    # Loopback only. A bare 8080:80 binds 0.0.0.0, and Docker's DNAT rules sit
+    # ahead of any INPUT-based host firewall, so it would be reachable by every
+    # tailnet peer and the LAN regardless of nftables.
+    ports:
+      - "127.0.0.1:${NC_HTTP_PORT:?}:80"
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_DB: ${POSTGRES_DB:?}
+      POSTGRES_USER: ${POSTGRES_USER:?}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      REDIS_HOST: redis
+      REDIS_HOST_PASSWORD: ${REDIS_HOST_PASSWORD:?}
+      NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_ADMIN_USER:?}
+      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD:?}
+      NEXTCLOUD_TRUSTED_DOMAINS: ${NC_FQDN:?} localhost 127.0.0.1
+      NEXTCLOUD_DATA_DIR: /mnt/ncdata
+      TRUSTED_PROXIES: ${NC_SUBNET:?}
+      OVERWRITEPROTOCOL: https
+      OVERWRITEHOST: ${NC_FQDN:?}
+      OVERWRITECLIURL: https://${NC_FQDN:?}
+      PHP_MEMORY_LIMIT: ${PHP_MEMORY_LIMIT:?}
+      PHP_UPLOAD_LIMIT: ${PHP_UPLOAD_LIMIT:?}
+      TZ: ${NC_TZ:?}
+    volumes:
+      - "html:/var/www/html"
+      - "${NC_ROOT:?}/data:/mnt/ncdata"
+      - "${NC_ROOT:?}/conf/zz-nextcloud.ini:/usr/local/etc/php/conf.d/zz-nextcloud.ini:ro"
+      - "${NC_ROOT:?}/conf/zzz-mpm.conf:/etc/apache2/conf-enabled/zzz-mpm.conf:ro"
+    mem_limit: ${APP_MEM:?}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1/status.php >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 600s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  db:
+    image: ${DB_IMAGE:?}
+    container_name: nc-db
+    restart: unless-stopped
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${DB_SHARED_BUFFERS:?}
+      - -c
+      - max_connections=50
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?}
+      POSTGRES_USER: ${POSTGRES_USER:?}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      TZ: ${NC_TZ:?}
+    volumes:
+      - "db:/var/lib/postgresql"
+    mem_limit: ${DB_MEM:?}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:?} -d ${POSTGRES_DB:?}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  redis:
+    image: ${REDIS_IMAGE:?}
+    container_name: nc-redis
+    restart: unless-stopped
+    # Persistence off and no eviction policy: a maxmemory-policy other than
+    # noeviction would silently drop Nextcloud's file locks.
+    command:
+      - redis-server
+      - --requirepass
+      - "${REDIS_HOST_PASSWORD:?}"
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    volumes:
+      - "redis:/data"
+    mem_limit: ${REDIS_MEM:?}
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+COMPOSE_HEAD
+
+  if (( CRON_OK )); then
+    cat <<'COMPOSE_CRON'
+
+  cron:
+    image: ${NC_IMAGE:?}
+    container_name: nc-cron
+    restart: unless-stopped
+    # The entrypoint override bypasses the image's PHP env templating, which is
+    # why the same php ini has to be bind-mounted here too.
+    entrypoint: /cron.sh
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - "html:/var/www/html"
+      - "${NC_ROOT:?}/data:/mnt/ncdata"
+      - "${NC_ROOT:?}/conf/zz-nextcloud.ini:/usr/local/etc/php/conf.d/zz-nextcloud.ini:ro"
+    environment:
+      TZ: ${NC_TZ:?}
+    mem_limit: ${CRON_MEM:?}
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+COMPOSE_CRON
+  fi
+
+  cat <<'COMPOSE_TAIL'
+
+volumes:
+  html:
+  db:
+  redis:
+
+networks:
+  default:
+    name: ${NC_PROJECT:?}_default
+    ipam:
+      driver: default
+      config:
+        - subnet: ${NC_SUBNET:?}
+COMPOSE_TAIL
+} >"$NC_ROOT/compose.yaml"
+chmod 0644 -- "$NC_ROOT/compose.yaml"
+note "wrote $NC_ROOT/compose.yaml"
+
+cat >"$NC_ROOT/conf/zz-nextcloud.ini" <<INI
+; Written by nextcloud-install. The zz- prefix makes this load after the
+; image's own nextcloud.ini, and it is the only PHP configuration the cron
+; sidecar sees at all, because its entrypoint override skips the templating.
+memory_limit = $PHP_MEMORY_LIMIT
+upload_max_filesize = $PHP_UPLOAD_LIMIT
+post_max_size = $PHP_UPLOAD_LIMIT
+max_execution_time = 3600
+max_input_time = 3600
+opcache.enable = 1
+opcache.enable_cli = 1
+opcache.interned_strings_buffer = 16
+opcache.max_accelerated_files = 10000
+opcache.memory_consumption = 128
+opcache.save_comments = 1
+opcache.revalidate_freq = 60
+apc.enable_cli = 1
+INI
+chmod 0644 -- "$NC_ROOT/conf/zz-nextcloud.ini"
+note "wrote $NC_ROOT/conf/zz-nextcloud.ini"
+
+cat >"$NC_ROOT/conf/zzz-mpm.conf" <<MPM
+# Written by nextcloud-install. mod_php requires mpm_prefork, so the prefork
+# block is almost certainly the live one - but both are capped, because on this
+# box MaxRequestWorkers is what actually bounds Apache's memory, and the worker
+# cap and the cgroup limit have to move together.
+<IfModule mpm_prefork_module>
+    StartServers             2
+    MinSpareServers          1
+    MaxSpareServers          3
+    MaxRequestWorkers        $MPM_MAX_WORKERS
+    MaxConnectionsPerChild   1000
+</IfModule>
+
+<IfModule mpm_event_module>
+    StartServers             2
+    MinSpareThreads          8
+    MaxSpareThreads          16
+    ThreadsPerChild          8
+    MaxRequestWorkers        $MPM_MAX_WORKERS
+    MaxConnectionsPerChild   1000
+</IfModule>
+MPM
+chmod 0644 -- "$NC_ROOT/conf/zzz-mpm.conf"
+note "wrote $NC_ROOT/conf/zzz-mpm.conf (MaxRequestWorkers $MPM_MAX_WORKERS, $RAM_PROFILE profile)"
+
+step '10/14  Validate, pull and start'
+
+compose() {
+  docker compose -f "$NC_ROOT/compose.yaml" --project-name "$NC_PROJECT" --project-directory "$NC_ROOT" "$@"
+}
+
+rendered=$(compose config 2>&1) || die \
+  'validated the generated compose file with docker compose config' \
+  "compose rejected it: $rendered" \
+  'a file that renders with every variable resolved' \
+  "read compose's own error above; the :? guards name the missing variable rather than substituting empty"
+note 'docker compose config validates'
+
+# The raw file still carries the ${NC_HTTP_PORT:?} reference rather than a
+# number, so this asserts the 127.0.0.1 prefix; the rendered form is checked
+# separately just below.
+grep -qE '^[[:space:]]+- "127\.0\.0\.1:[^"]+:80"$' -- "$NC_ROOT/compose.yaml" || die \
+  'grepped the generated compose file for a loopback-qualified published port' \
+  'no "127.0.0.1:<port>:80" entry found' \
+  'the app service published on 127.0.0.1 only' \
+  "refusing to start: an unqualified publish binds 0.0.0.0, and Docker's DNAT rules sit ahead of any INPUT-based host firewall"
+case "$rendered" in
+  *0.0.0.0*)
+    die \
+      'checked the rendered compose configuration for a wildcard bind address' \
+      'the rendered configuration mentions 0.0.0.0' \
+      'every published port bound to 127.0.0.1' \
+      'refusing to start; inspect: docker compose config'
+    ;;
+esac
+if grep -qE '^[[:space:]]+user:' <<<"$rendered"; then
+  die \
+    'asserted that no service sets a user: key' \
+    'the rendered configuration contains a user: key' \
+    'no user: on app or cron' \
+    "the official nextcloud image's entrypoint must start as root to fix permissions and bind port 80 before dropping to www-data; chown the bind mount instead"
+fi
+note 'published port is loopback-only and no service overrides user:'
+
+compose pull
+compose up -d
+note 'stack started'
+
+step '11/14  Wait for nc-app to become healthy'
+
+# 60 x 10s: the first start rsyncs the whole Nextcloud tree into the html volume
+# and takes minutes on an N5105.
+health=''
+for i in $(seq 1 60); do
+  health=$(docker inspect -f '{{ if .State.Health }}{{ .State.Health.Status }}{{ else }}nohealthcheck{{ end }}' nc-app 2>/dev/null || true)
+  [[ "$health" == healthy ]] && break
+  printf '  %3ss  nc-app: %s\n' "$(( i * 10 ))" "${health:-not created yet}"
+  sleep 10
+done
+
+if [[ "$health" != healthy ]]; then
+  printf '\nlast 100 lines from the app container:\n' >&2
+  compose logs --tail=100 app >&2 || true
+  die \
+    'waited 600 seconds for the nc-app container to report healthy' \
+    "its health status is '${health:-unknown}'" \
+    'healthy' \
+    'read the log above; the stack is up but not serving, so nothing was configured with occ and nothing was declared working'
+fi
+note 'nc-app is healthy'
+
+step '12/14  occ configuration'
+
+occ() {
+  # -T is mandatory, not cosmetic: without it every scripted call fails with
+  # 'the input device is not a TTY' and aborts this script under set -e.
+  compose exec -T -u www-data app php occ "$@"
+}
+
+occ status || die \
+  'ran occ status inside the app container' \
+  'occ status failed' \
+  'a completed Nextcloud installation' \
+  'the container is healthy but Nextcloud is not installed; read: docker compose logs app'
+
+# NEXTCLOUD_TRUSTED_DOMAINS is applied only inside the entrypoint's fresh-install
+# branch, so it is set again here where it will still take effect on a re-run.
+set_trusted_domain() {
+  occ config:system:set trusted_domains "$1" --value="$2" >/dev/null || die \
+    "set trusted_domains[$1] with occ" \
+    "occ config:system:set trusted_domains $1 --value=$2 failed" \
+    'occ to accept the value' \
+    "the stack is up but the browser will report an untrusted domain; fix by hand with: nextcloud-occ config:system:set trusted_domains $1 --value=$2"
+}
+set_trusted_domain 0 "$NC_FQDN"
+set_trusted_domain 1 localhost
+set_trusted_domain 2 127.0.0.1
+note "trusted_domains: $NC_FQDN localhost 127.0.0.1"
+
+if compose exec -T app php -m 2>/dev/null | grep -qix apcu; then
+  occ config:system:set memcache.local --value='\OC\Memcache\APCu' >/dev/null || \
+    warn 'apcu is loaded but occ refused memcache.local; left unset'
+  note 'memcache.local = \OC\Memcache\APCu'
+else
+  warn 'the apcu extension is not loaded in this image; memcache.local left unset rather than pointing at a class that is not there'
+fi
+
+# The distributed cache and the file locking cache are configured by the image's
+# own redis fragment from REDIS_HOST/REDIS_HOST_PASSWORD, which is re-read every
+# start; setting them again here would be shadowed by it.
+
+pick_maintenance_hour() {
+  local unit next hour busy=' ' candidate
+  while IFS= read -r unit; do
+    [[ -n "$unit" ]] || continue
+    next=$(run_user_systemctl show "$unit" -p NextElapseUSecRealtime --value 2>/dev/null || true)
+    [[ "$next" =~ ^[0-9]+$ ]] || continue
+    (( next > 0 )) || continue
+    hour=$(date -u -d "@$(( next / 1000000 ))" +%H 2>/dev/null || true)
+    [[ -n "$hour" ]] && busy="${busy}${hour} "
+  done < <(run_user_systemctl list-unit-files --no-legend 'cloud-nas*.timer' 2>/dev/null | awk '{ print $1 }' || true)
+  for candidate in 20 21 22 19 18 17; do
+    case "$busy" in *" $candidate "*) continue ;; esac
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  printf '20\n'
+}
+
+mw_hour=$(pick_maintenance_hour)
+if occ config:system:set maintenance_window_start --value="$mw_hour" --type=integer >/dev/null 2>&1 \
+  && occ config:system:get maintenance_window_start >/dev/null 2>&1; then
+  note "maintenance_window_start = $mw_hour (UTC hour, chosen to miss the cloud-nas timers)"
+else
+  occ config:system:delete maintenance_window_start >/dev/null 2>&1 || true
+  warn 'maintenance_window_start was not recognised by this Nextcloud version; removed it again'
+fi
+
+if (( CRON_OK )); then
+  if occ background:cron >/dev/null 2>&1; then
+    note 'background jobs set to Cron mode, served by the nc-cron sidecar'
+  else
+    warn 'occ background:cron is unavailable; the mode flips to Cron by itself once cron.php runs from the command line'
+  fi
+fi
+
+step '13/14  Verification'
+
+compose ps
+
+note ''
+note "docker.service is-enabled: $(systemctl is-enabled docker.service 2>/dev/null || printf unknown)"
+note "docker.service is-active:  $(systemctl is-active docker.service 2>/dev/null || printf unknown)"
+note "trusted_proxies:           $(occ config:system:get trusted_proxies 2>/dev/null | tr '\n' ' ' || printf unknown)"
+note "apache MPM:                $(compose exec -T app apachectl -V 2>/dev/null | grep 'Server MPM' | tr -s ' ' || printf unknown)"
+
+if command -v ss >/dev/null 2>&1; then
+  while IFS= read -r bind; do
+    [[ -n "$bind" ]] || continue
+    case "$bind" in
+      127.0.0.1:*) note "listener:                  $bind (loopback only, as intended)" ;;
+      *) die \
+        "checked which address the published port $NC_HTTP_PORT is bound to" \
+        "found a listener on $bind" \
+        'a listener on 127.0.0.1 only' \
+        'plain-HTTP Nextcloud is exposed beyond loopback; stop the stack with nextcloud-uninstall and fix the ports entry before going any further' ;;
+    esac
+  done < <(ss -H -ltn "sport = :${NC_HTTP_PORT}" 2>/dev/null | awk '{ print $4 }' || true)
+fi
+
+if command -v curl >/dev/null 2>&1; then
+  status_json=$(curl -fsS --max-time 20 "https://${NC_FQDN}/status.php" 2>/dev/null || true)
+  case "$status_json" in
+    *'"installed":true'* | *'"installed": true'*)
+      note "status.php:                installed=true over https://${NC_FQDN}/"
+      ;;
+    '')
+      warn "https://${NC_FQDN}/status.php returned nothing; check tailscale serve status and the app logs"
+      ;;
+    *)
+      warn "https://${NC_FQDN}/status.php answered but did not report installed=true: $status_json"
+      ;;
+  esac
+
+  # The definitive Windows-client predictor. Behind a TLS-terminating proxy
+  # without overwriteprotocol, Nextcloud hands back an http:// poll endpoint and
+  # Login Flow v2 aborts with a message owners read as a certificate fault.
+  login_json=$(curl -fsS --max-time 20 -X POST "https://${NC_FQDN}/index.php/login/v2" 2>/dev/null || true)
+  case "$login_json" in
+    *'"endpoint":"https:'* | *'"endpoint": "https:'*)
+      note 'login/v2:                  poll endpoint is https - the Windows client will accept this server'
+      ;;
+    *)
+      warn 'login/v2 did not return an https poll endpoint; do NOT touch Windows until it does'
+      warn "re-check with: curl -fsS -X POST https://${NC_FQDN}/index.php/login/v2"
+      ;;
+  esac
+else
+  warn 'curl is not installed here, so the two go/no-go probes were skipped; run them from another machine:'
+  warn "  curl -fsS https://${NC_FQDN}/status.php"
+  warn "  curl -fsS -X POST https://${NC_FQDN}/index.php/login/v2"
+fi
+
+note ''
+free -m || true
+docker stats --no-stream || true
+
+step '14/14  Next: Corsair (Windows)'
+
+cat <<WINDOWS
+
+Nextcloud is at:  https://${NC_FQDN}/
+  admin user:     ${NC_ADMIN_USER}
+  admin password: ${NC_ADMIN_PASSWORD}
+
+Both passwords and the database credentials are in ${NC_ROOT}/.env, mode 0600.
+Copy the admin password somewhere safe now; nothing prints it again.
+
+On Corsair, in an elevated PowerShell:
+
+  winget install --id Nextcloud.NextcloudDesktop --exact --source winget --accept-package-agreements --accept-source-agreements
+
+If winget is unavailable, the confirmed MSI is:
+
+  https://github.com/nextcloud-releases/desktop/releases/download/v34.0.1/Nextcloud-34.0.1-x64.msi
+
+Then, in the client:
+
+  1. Log in to https://${NC_FQDN} and let the system browser finish Login Flow v2.
+     The certificate is a real Let's Encrypt one, so nothing has to be trusted by hand.
+  2. Put the sync folder at C:\\Nextcloud.
+     NEVER under a OneDrive-managed path. This NAS already mirrors that same
+     OneDrive account into NAS_03, and two Cloud Files API providers over one
+     tree produce hydration storms whose churn rides the rclone pipeline back
+     onto this box.
+  3. Keep the path short. Windows MAX_PATH is 260 and Nextcloud's filename limit
+     is 255 BYTES, which UTF-8 Vietnamese consumes at up to 3 bytes per character.
+     Test the d-with-stroke characters and NFC/NFD normalisation deliberately.
+  4. Read the virtual-files wording off the folder-setup dialog rather than
+     trusting a remembered label; the 34.x documentation page is currently 404.
+
+WINDOWS
+
+step 'Residue and follow-ups'
+
+note "state file:  $NCT_CONF (nextcloud-uninstall reads only this)"
+note "  DOCKER_ENABLED_BY_US=$DOCKER_ENABLED_BY_US TS_SERVE_SET_BY_US=$TS_SERVE_SET_BY_US ZRAM_BY_US=$ZRAM_BY_US SYSCTL_BY_US=$SYSCTL_BY_US OOMADJ_BY_US=$OOMADJ_BY_US"
+if (( OOMADJ_BY_US )); then
+  note 'tailscaled OOMScoreAdjust=-900 is written but takes effect at the NEXT BOOT.'
+  note 'tailscaled was deliberately not restarted: that drops the SSH session you are on.'
+fi
+if (( SYSCTL_BY_US )); then
+  note 'IP forwarding was enabled before Docker started; removing the sysctl file later'
+  note 'does not reset it at runtime - that needs a reboot or an explicit sysctl -w.'
+fi
+note ''
+note 'Next commands:'
+note '  nextcloud-status      health, certificate expiry, free space, the login/v2 probe'
+note '  nextcloud-postflight  assert that nothing on this box was disturbed'
+note '  nextcloud-occ status  run occ inside the app container'
+note '  nextcloud-uninstall --help'
+note ''
+note 'Deliberately NOT installed: notify_push, previewgenerator, Collabora,'
+note 'OnlyOffice, Talk HPB and Imaginary. Desktop clients poll every 30 seconds,'
+note 'which is the real vanilla behaviour. nextcloud-push-enable is the documented'
+note 'follow-up and refuses under 6 GiB of RAM.'
+note ''
+note 'Before you reboot to prove the stack comes back, check all three:'
+note '  systemctl is-enabled tailscaled'
+note '  the tailnet node key is not expired'
+note '  the bootloader still has a previous-kernel entry'

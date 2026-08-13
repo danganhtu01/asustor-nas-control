@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  exec sudo -- "$0" "$@"
+fi
+
+if [[ ! -r /usr/local/bin/nextcloud-lib ]]; then
+  printf 'error: checked for the helper library at /usr/local/bin/nextcloud-lib\n' >&2
+  printf '  found:    no readable file at that path\n' >&2
+  printf '  expected: the library installed beside the other nextcloud-* commands\n' >&2
+  printf '  fix:      re-run ./scripts/install.sh from the repo checkout\n' >&2
+  exit 1
+fi
+
+# shellcheck source=/dev/null
+source /usr/local/bin/nextcloud-lib
+require_conf
+
+# -T is mandatory, not cosmetic: without it every non-interactive call fails
+# with 'the input device is not a TTY' and aborts the caller under pipefail.
+exec docker compose -f "${NC_ROOT}/compose.yaml" --project-name "$NC_PROJECT" exec -T -u www-data app php occ "$@"

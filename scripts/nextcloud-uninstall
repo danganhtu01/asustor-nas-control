@@ -1,0 +1,642 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2154  # NC_* and the *_BY_US flags arrive from require_conf, which sources a file shellcheck cannot follow
+set -euo pipefail
+
+# nextcloud-uninstall - tears the nextcloud-trial stack down in the documented
+# order and stops on the first failure of a step that is not best-effort,
+# because a half-removed install is worse than either end state.
+
+CONF_DIR=/etc/nextcloud-trial
+STATE_DIR=/var/lib/nextcloud-trial
+BIN_DIR=/usr/local/bin
+OOM_DROPIN=/etc/systemd/system/tailscaled.service.d/10-nextcloud-trial-oom.conf
+SYSCTL_FILE=/etc/sysctl.d/99-nextcloud-trial-forward.conf
+ZRAM_FILE=/etc/systemd/zram-generator.conf
+COMMANDS=(nextcloud-lib nextcloud-preflight nextcloud-install nextcloud-status
+  nextcloud-occ nextcloud-postflight nextcloud-uninstall nextcloud-push-enable)
+CNC_KEYS=(NAS02_MOUNT NAS03_MOUNT NAS03_TARGET NAS02_BACKUP_ROOT CLOUD_NAS_STATE_DIR)
+
+purge_data=0
+purge_baselines=0
+docker_ok=0
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  nextcloud-uninstall [--purge-data] [--purge-baselines]
+
+Tears down the nextcloud-trial stack. Refuses unless the installer's state file
+exists and NC_ROOT still carries the .nextcloud-trial-owned marker: this command
+does not delete a tree it did not create.
+
+Options:
+  --purge-data       erase NC_ROOT itself, including every user file under it.
+                     Also requires typing the path when asked. Without this the
+                     files, the pre-teardown dump and the config capture stay.
+  --purge-baselines  also remove /var/lib/nextcloud-trial/baseline-*, which is
+                     the evidence that nothing else on the box was disturbed.
+  -h, --help         print this and exit.
+
+The pacman removal and the reboot are printed, never performed.
+USAGE
+}
+
+# Flags are read before the sudo re-exec so that --help, which is what the
+# installer's Try: block suggests, does not ask for a password.
+for arg in "$@"; do
+  case "$arg" in
+    --purge-data) purge_data=1 ;;
+    --purge-baselines) purge_baselines=1 ;;
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  exec sudo -- "$0" "$@"
+fi
+
+lib=''
+for candidate in "${BASH_SOURCE[0]%/*}/nextcloud-lib" "$BIN_DIR/nextcloud-lib"; do
+  if [[ -r "$candidate" ]]; then
+    lib=$candidate
+    break
+  fi
+done
+if [[ -z "$lib" ]]; then
+  printf 'error: checked for nextcloud-lib beside this script and in %s\n' "$BIN_DIR" >&2
+  printf '  found:    neither is readable\n' >&2
+  printf '  expected: the sourced helper library this command is written against\n' >&2
+  printf '  fix:      reinstall it with: install -Dm755 scripts/nextcloud-lib %s/nextcloud-lib\n' "$BIN_DIR" >&2
+  exit 1
+fi
+# shellcheck source=/dev/null
+source "$lib"
+
+require_conf
+
+SQL_OUT="$NC_ROOT/pre-teardown.sql"
+CFG_OUT="$NC_ROOT/pre-teardown-config.php"
+ENV_FILE="$NC_ROOT/.env"
+COMPOSE_FILE="$NC_ROOT/compose.yaml"
+
+step() {
+  printf '\n== %s ==\n' "$1"
+}
+
+project_containers() {
+  docker ps -aq --filter "label=com.docker.compose.project=$NC_PROJECT" 2>/dev/null || true
+}
+
+# Compose labels its volumes, but a volume left by an older compose may not be
+# labelled, so the project name prefix is kept as a second reading.
+project_volumes() {
+  {
+    docker volume ls -q --filter "label=com.docker.compose.project=$NC_PROJECT" 2>/dev/null || true
+    docker volume ls -q --filter "name=^${NC_PROJECT}_" 2>/dev/null || true
+  } | sort -u
+}
+
+volume_exists() {
+  local found
+  found=$(docker volume ls -q --filter "name=^${1}\$" 2>/dev/null || true)
+  [[ -n "$found" ]]
+}
+
+service_container() {
+  local found
+  found=$(docker ps -q \
+    --filter "label=com.docker.compose.project=$NC_PROJECT" \
+    --filter "label=com.docker.compose.service=$1" 2>/dev/null || true)
+  printf '%s\n' "${found%%$'\n'*}"
+}
+
+env_value() {
+  local key=$1 value
+
+  [[ -r "$ENV_FILE" ]] || die \
+    "checked for the compose environment file at $ENV_FILE" \
+    'no readable file there' \
+    "the .env nextcloud-install wrote beside compose.yaml, which is where $key lives" \
+    "restore it, or - if you accept losing the database - remove the volume yourself with: docker volume rm ${NC_PROJECT}_db ; then re-run"
+
+  grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" -- "$ENV_FILE" || die \
+    "checked that $ENV_FILE sets $key" \
+    'the key is not in the file' \
+    "$key, so pg_dump can be told which role and database to read" \
+    "add it back from your notes, or - if you accept losing the database - remove the volume yourself with: docker volume rm ${NC_PROJECT}_db ; then re-run"
+
+  # Bare assignment: cnc_get exits rather than return when the value carries an
+  # unresolved shell expansion, and an 'if' here would read that refusal as a
+  # merely-absent key and carry on with an empty credential.
+  value=$(cnc_get "$ENV_FILE" "$key")
+  printf '%s\n' "$value"
+}
+
+# Written aside and moved into place because a plain '> file' truncates before
+# the dump runs: a failed attempt would otherwise destroy a good dump that an
+# earlier run had already taken.
+capture_to() {
+  local out=$1
+  shift
+  local part="$out.partial"
+
+  if "$@" >"$part" && [[ -s "$part" ]]; then
+    mv -- "$part" "$out"
+    return 0
+  fi
+  rm -f -- "$part"
+  return 1
+}
+
+confirm_purge() {
+  local answer=''
+
+  [[ -t 0 ]] || die \
+    'checked for a terminal on stdin before asking for the --purge-data confirmation' \
+    'stdin is not a terminal' \
+    'an interactive run: --purge-data is confirmed by typing a string, never by a flag alone and never by y/n' \
+    'run it from an interactive shell. Nothing has been changed yet.'
+
+  printf '\n--purge-data will ERASE this tree and everything in it:\n\n'
+  printf '  %s\n\n' "$NC_ROOT"
+  printf 'The pre-teardown database dump and config capture are written INSIDE that\n'
+  printf 'tree and go with it. Copy them elsewhere afterwards only if you skip this.\n'
+  printf 'Nothing undoes this. Type the path exactly to confirm, anything else to keep it.\n'
+  printf '> '
+  IFS= read -r answer || answer=''
+
+  [[ "$answer" == "$NC_ROOT" ]] || die \
+    'checked the typed confirmation for --purge-data' \
+    "you typed '$answer'" \
+    "the exact string $NC_ROOT" \
+    'nothing has been removed. Re-run without --purge-data to tear the stack down and keep the files.'
+}
+
+# The guard that keeps a teardown from deleting the rclone mirror. It refuses
+# rather than answering 'not contained' for anything it cannot evaluate.
+guard_cloud_nas() {
+  local root=$1
+  local conf='' key value probe hits='' units=0 unit_list='' resolved=0
+
+  [[ -z "$NC_OWNER_HOME" ]] || conf="$NC_OWNER_HOME/.config/cloud-nas/cloud-nas.conf"
+
+  if [[ -z "$conf" || ! -r "$conf" ]]; then
+    [[ -n "$NC_OWNER" && "$NC_OWNER_UID" =~ ^[0-9]+$ ]] || die \
+      'checked that the cloud-nas pipeline could be located before erasing the tree' \
+      "NC_OWNER='$NC_OWNER' NC_OWNER_UID='$NC_OWNER_UID', so the owner config and user manager cannot be reached" \
+      'an owner name and uid, so the containment guard can actually be evaluated' \
+      "correct them in $CONF_DIR/nextcloud-trial.conf, or delete the tree by hand once you have checked by eye that it is outside every cloud-nas path"
+
+    for probe in cloud-nas-lib cloud-nas-sync cloud-nas-backup-to-nas02; do
+      if [[ -e "$NC_OWNER_HOME/.local/bin/$probe" ]]; then
+        hits="$hits $NC_OWNER_HOME/.local/bin/$probe"
+      fi
+    done
+    if unit_list=$(run_user_systemctl list-unit-files 'cloud-nas*' 2>/dev/null); then
+      units=$(grep -c '^cloud-nas' <<<"$unit_list" || true)
+    fi
+
+    if [[ -n "$hits" || "$units" -gt 0 ]]; then
+      die \
+        'checked whether the rclone pipeline is present before erasing the tree' \
+        "the pipeline is here (commands:${hits:- none}, $units cloud-nas user unit files) but $conf is not readable" \
+        'a readable cloud-nas.conf, so NC_ROOT can be proved to sit outside every rclone-managed path' \
+        'restore read access to that config and re-run. Absence of the config is not evidence the pipeline is absent, and guessing its paths is how a mirror gets deleted.'
+    fi
+
+    warn "no cloud-nas pipeline detected at all: no readable $conf, no ~/.local/bin/cloud-nas-* and no cloud-nas user units. If it should be here, this is not the machine you think it is - stop."
+    return 0
+  fi
+
+  for key in "${CNC_KEYS[@]}"; do
+    grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" -- "$conf" || continue
+    value=$(cnc_get "$conf" "$key" "$NC_OWNER_HOME")
+    [[ -n "$value" ]] || continue
+    resolved=$((resolved + 1))
+
+    if path_is_within "$root" "$value"; then
+      die \
+        "checked that $root sits outside every rclone-managed path" \
+        "$root is inside $key=$value" \
+        'a tree no rclone job sweeps' \
+        'refusing to delete this from here: the pipeline manages that path, and removing a tree from under rclone is how the mirror loses data.'
+    fi
+    if path_is_within "$value" "$root"; then
+      die \
+        "checked that no rclone-managed path sits inside $root" \
+        "$key=$value is inside $root" \
+        'NC_ROOT containing nothing but Nextcloud' \
+        'refusing to erase a tree that contains part of the cloud mirror. Move that path out first, or delete only the Nextcloud subdirectories by hand.'
+    fi
+  done
+
+  [[ "$resolved" -gt 0 ]] || warn "read $conf but none of ${CNC_KEYS[*]} are set in it; the containment guard had nothing to test"
+}
+
+purge_tree() {
+  local root stripped mnt fstype src
+
+  # Resolved before it is tested, so that /, //, /. and /srv/.. all fail the
+  # root-directory check rather than only the literal one-character spelling.
+  root=$(readlink -m -- "${NC_ROOT:?NC_ROOT is not set}")
+  stripped=${NC_ROOT%/}
+
+  [[ "$root" != / ]] || die \
+    'checked that NC_ROOT is not the root directory' \
+    "NC_ROOT='$NC_ROOT' resolves to /" \
+    'an absolute path below /' \
+    "correct NC_ROOT in $CONF_DIR/nextcloud-trial.conf; nothing is deleted while it reads /"
+  [[ "$root" == /?* ]] || die \
+    'checked that NC_ROOT is absolute' \
+    "NC_ROOT='$NC_ROOT' resolves to '$root'" \
+    'an absolute path' \
+    "correct NC_ROOT in $CONF_DIR/nextcloud-trial.conf"
+  [[ "$root" == "$stripped" ]] || die \
+    'checked that NC_ROOT resolves to itself before deleting it' \
+    "NC_ROOT='$NC_ROOT' resolves to '$root'" \
+    'a plain absolute path with no symlinked component' \
+    'a symlink here means the delete lands somewhere other than the path in the state file. Resolve it by hand and correct NC_ROOT.'
+
+  if [[ ! -e "$root" ]]; then
+    note "$root is already gone"
+    return 0
+  fi
+  [[ -d "$root" ]] || die \
+    "checked that $root is a directory before erasing it" \
+    'it is not a directory' \
+    'the Nextcloud tree' \
+    'inspect it by hand; this command deletes directories only'
+  [[ -e "$root/.nextcloud-trial-owned" ]] || die \
+    "checked for the ownership marker at $root/.nextcloud-trial-owned" \
+    'the marker is gone' \
+    'the marker nextcloud-install wrote when it created the tree' \
+    'refusing to erase a tree this project cannot prove it created. Check the path, then delete it by hand if you are certain.'
+
+  guard_cloud_nas "$root"
+
+  mnt=$(mnt_of "$root")
+  fstype=$(fstype_of "$root")
+  src=$(src_of "$root" || true)
+  note "erasing $root - fstype $fstype, mount $mnt, source ${src:-unknown}"
+
+  if [[ "$mnt" == "$root" ]]; then
+    # A zfs dataset mounted at NC_ROOT is the one legitimate way for NC_ROOT to
+    # be a mountpoint: the installer requires the dataset rather than creating
+    # a directory. Every other filesystem here would mean erasing a mount.
+    [[ "$fstype" == zfs ]] || die \
+      'checked that NC_ROOT is not itself a mountpoint' \
+      "$root is the mountpoint of ${src:-unknown} ($fstype)" \
+      'a directory inside a mounted filesystem, not the mount itself' \
+      "refusing: emptying a mount is how an array gets wiped. Unmount it, or remove the Nextcloud subdirectories under $root by hand."
+    command -v zfs >/dev/null 2>&1 || die \
+      'checked for the zfs command before destroying the dataset' \
+      'zfs is not on PATH' \
+      'the zfs utilities, since NC_ROOT is a zfs dataset mountpoint' \
+      "install them, or destroy the dataset yourself with: zfs destroy ${src:-<pool>/<dataset>}"
+    [[ "$src" == */* ]] || die \
+      'checked that the zfs source is a dataset and not a bare pool' \
+      "findmnt reports source '${src:-unknown}'" \
+      'a <pool>/<dataset> name' \
+      'refusing: zfs destroy on a pool root would take the whole pool. Destroy it yourself after checking the name.'
+    if ! zfs destroy "$src"; then
+      die \
+        "checked that zfs destroy $src succeeded" \
+        'it returned non-zero' \
+        'the dataset destroyed' \
+        'it is probably busy or has children. Resolve that by hand; nothing else is left to remove.'
+    fi
+  elif [[ "$fstype" == btrfs ]] && command -v btrfs >/dev/null 2>&1 && btrfs subvolume show "$root" >/dev/null 2>&1; then
+    if ! btrfs subvolume delete -- "$root"; then
+      die \
+        "checked that btrfs subvolume delete succeeded on $root" \
+        'it returned non-zero' \
+        'the subvolume deleted' \
+        "it usually means nested subvolumes; list them with: btrfs subvolume list $mnt , delete those first, then re-run"
+    fi
+  else
+    rm -rf -- "${root:?}"
+  fi
+
+  [[ ! -e "$root" ]] || die \
+    "checked that $root was gone after the delete" \
+    'it is still there' \
+    'an erased tree' \
+    "something is still holding it, or a nested mount is in the way. Check with: findmnt -R --target $root"
+
+  note "removed $root"
+}
+
+# ---------------------------------------------------------------------------
+
+step 'Preconditions'
+note "project:  $NC_PROJECT"
+note "tree:     $NC_ROOT"
+note "owner:    ${NC_OWNER:-unknown}"
+note "fqdn:     ${NC_FQDN:-unknown}"
+note "port:     ${NC_HTTP_PORT:-unknown}"
+note "flags:    DOCKER_ENABLED_BY_US=$DOCKER_ENABLED_BY_US TS_SERVE_SET_BY_US=$TS_SERVE_SET_BY_US ZRAM_BY_US=$ZRAM_BY_US SYSCTL_BY_US=$SYSCTL_BY_US OOMADJ_BY_US=$OOMADJ_BY_US"
+
+[[ -e "$NC_ROOT/.nextcloud-trial-owned" ]] || die \
+  "checked for the ownership marker at $NC_ROOT/.nextcloud-trial-owned" \
+  'no such file' \
+  'the marker nextcloud-install writes into NC_ROOT when it creates the tree' \
+  'this command removes only trees this project created. If you moved or restored NC_ROOT, check the path is right and put the marker back by hand.'
+
+if command -v docker >/dev/null 2>&1; then
+  if docker info >/dev/null 2>&1; then
+    docker_ok=1
+  else
+    die \
+      'checked that the docker daemon answers before removing anything' \
+      'the docker CLI is installed but docker info failed' \
+      'a running daemon, so the project containers, volumes and network can actually be seen and removed' \
+      'start it with: systemctl start docker.service ; then re-run. A teardown that cannot see the objects it claims to remove reports a false all-clear.'
+  fi
+else
+  warn 'docker is not installed; steps 1-4 have nothing to act on'
+fi
+
+# Asked now, not at step 9: by then this command has removed itself from
+# /usr/local/bin, so a refusal there would leave no way to re-run it.
+if [[ "$purge_data" -eq 1 ]]; then
+  confirm_purge
+fi
+
+step 'Step 1: mandatory backup, before anything is destroyed'
+if [[ "$docker_ok" -ne 1 ]]; then
+  warn 'no docker daemon, so no dump can be taken - and nothing container-side can be destroyed either'
+else
+  db_volume="${NC_PROJECT}_db"
+  html_volume="${NC_PROJECT}_html"
+
+  if ! volume_exists "$db_volume"; then
+    note "no $db_volume volume on this host; there is no database left to dump"
+  elif [[ -s "$SQL_OUT" ]]; then
+    note "keeping the dump an earlier run already wrote to $SQL_OUT"
+  else
+    db_user=$(env_value POSTGRES_USER)
+    db_name=$(env_value POSTGRES_DB)
+    db_cid=$(service_container db)
+    if capture_to "$SQL_OUT" docker compose -f "$COMPOSE_FILE" --project-name "$NC_PROJECT" \
+      exec -T db pg_dump -U "$db_user" "$db_name"; then
+      note "wrote $SQL_OUT"
+    elif [[ -n "$db_cid" ]] && capture_to "$SQL_OUT" docker exec "$db_cid" pg_dump -U "$db_user" "$db_name"; then
+      note "wrote $SQL_OUT via the labelled container, the compose file being unusable"
+    else
+      die \
+        'checked that a database dump could be taken before anything is destroyed' \
+        'both docker compose exec -T db pg_dump and a direct docker exec against the labelled db container failed' \
+        "a non-empty dump at $SQL_OUT - the $db_volume volume is about to be removed and nothing else holds that data" \
+        "bring the stack up first: docker compose -f $COMPOSE_FILE --project-name $NC_PROJECT up -d db app ; then re-run. If you accept losing the database: docker volume rm $db_volume ; then re-run."
+    fi
+  fi
+
+  if ! volume_exists "$html_volume"; then
+    note "no $html_volume volume on this host; config.php is already gone"
+  elif [[ -s "$CFG_OUT" ]]; then
+    note "keeping the config capture an earlier run already wrote to $CFG_OUT"
+  else
+    app_cid=$(service_container app)
+    if capture_to "$CFG_OUT" docker compose -f "$COMPOSE_FILE" --project-name "$NC_PROJECT" \
+      exec -T app cat /var/www/html/config/config.php; then
+      note "wrote $CFG_OUT"
+    elif [[ -n "$app_cid" ]] && capture_to "$CFG_OUT" docker exec "$app_cid" cat /var/www/html/config/config.php; then
+      note "wrote $CFG_OUT via the labelled container, the compose file being unusable"
+    else
+      die \
+        'checked that config.php could be captured before anything is destroyed' \
+        'both docker compose exec -T app cat and a direct docker exec against the labelled app container failed' \
+        "a non-empty capture at $CFG_OUT - the $html_volume volume holds config.php and every installed app, and its removal is genuinely irreversible" \
+        "bring the stack up first: docker compose -f $COMPOSE_FILE --project-name $NC_PROJECT up -d app ; then re-run. If you accept losing it: docker volume rm $html_volume ; then re-run."
+    fi
+  fi
+fi
+
+step 'Step 2: stop and remove the stack'
+if [[ "$docker_ok" -ne 1 ]]; then
+  note 'skipped: no docker daemon'
+elif [[ ! -f "$COMPOSE_FILE" ]]; then
+  warn "no compose file at $COMPOSE_FILE; going straight to the scoped label sweep"
+elif docker compose --profile push -f "$COMPOSE_FILE" --project-name "$NC_PROJECT" \
+  down --volumes --remove-orphans; then
+  note 'compose down completed; the bind mount at NC_ROOT/data survives it by design'
+else
+  warn 'docker compose down failed - a hand-edited compose file or a missing .env does that. The scoped label sweep below is the primary removal path.'
+fi
+
+step 'Step 3: scoped label sweep'
+if [[ "$docker_ok" -ne 1 ]]; then
+  note 'skipped: no docker daemon'
+else
+  # Scoped to the project label on purpose. container/volume/image prune are all
+  # unscoped and would reach objects outside this project.
+  ids=$(project_containers)
+  if [[ -n "$ids" ]]; then
+    printf '%s\n' "$ids" | xargs -r docker rm -f || warn 'some containers could not be removed'
+  fi
+  vols=$(project_volumes)
+  if [[ -n "$vols" ]]; then
+    printf '%s\n' "$vols" | xargs -r docker volume rm || warn 'some volumes could not be removed'
+  fi
+  docker network rm "${NC_PROJECT}_default" 2>/dev/null || true
+
+  ids=$(project_containers)
+  vols=$(project_volumes)
+  [[ -z "$ids$vols" ]] || die \
+    'checked that nothing still carries the project label after the sweep' \
+    "containers: ${ids:-none}; volumes: ${vols:-none}" \
+    'none of either' \
+    'remove them by hand with docker rm -f and docker volume rm. This will not report success while the project objects are still there.'
+  note 'no containers, volumes or network left carrying the project label'
+fi
+
+step 'Step 4: remove the images'
+if [[ "$docker_ok" -ne 1 ]]; then
+  note 'skipped: no docker daemon'
+else
+  images=()
+  for image in "$NC_IMAGE" "$DB_IMAGE" "$REDIS_IMAGE"; do
+    if [[ -n "$image" ]]; then
+      images+=("$image")
+    fi
+  done
+  if [[ ${#images[@]} -gt 0 ]]; then
+    # Named explicitly and best-effort: every image here is registry-tagged, so
+    # compose's --rmi local would have removed none of them.
+    docker image rm "${images[@]}" 2>/dev/null || true
+    note "asked docker to remove: ${images[*]}"
+  else
+    warn 'the state file records no image tags; nothing to remove here'
+  fi
+fi
+
+step 'Step 5: remove the tailscale serve mapping'
+if [[ "$TS_SERVE_SET_BY_US" != 1 ]]; then
+  note "TS_SERVE_SET_BY_US=$TS_SERVE_SET_BY_US; the :443 handler was not created by this installer and is left exactly as it was"
+elif ! command -v tailscale >/dev/null 2>&1; then
+  warn 'tailscale is not on PATH; the :443 handler cannot be removed from here'
+elif [[ ! "$NC_HTTP_PORT" =~ ^[0-9]+$ ]]; then
+  warn "NC_HTTP_PORT='$NC_HTTP_PORT' is not a port number, so the targeted removal cannot be built. Remove it by hand with: tailscale serve --https=443 off"
+else
+  serve_target="http://127.0.0.1:${NC_HTTP_PORT}"
+  if ! tailscale serve --https=443 "$serve_target" off; then
+    # Documented as equivalent: "You can omit the <target> argument, so these 2
+    # commands are equivalent". Never 'serve reset', which clears every handler
+    # on the node including any the owner had before this project.
+    tailscale serve --https=443 off || true
+  fi
+  if serve_json=$(tailscale serve status --json 2>/dev/null); then
+    # Here-string, not a pipe: grep -q exits on the first match and the pipeline
+    # would then carry printf's SIGPIPE 141 under pipefail, reading a handler
+    # that is still there as one that is gone.
+    if grep -qF -- "$serve_target" <<<"$serve_json"; then
+      die \
+        'checked that the :443 serve handler was gone after removing it' \
+        "tailscale serve status --json still lists $serve_target" \
+        'no handler pointing at this stack' \
+        "remove it by hand with: tailscale serve --https=443 off - and do NOT use tailscale serve reset, which clears every handler on the node"
+    fi
+    note "serve status no longer lists $serve_target"
+  else
+    warn 'tailscale serve status --json did not return cleanly, so the removal could not be verified. Check by hand with: tailscale serve status'
+  fi
+fi
+
+step 'Step 6: remove the host files this installer created'
+reloaded=0
+if [[ "$OOMADJ_BY_US" == 1 ]]; then
+  if [[ -e "$OOM_DROPIN" ]]; then
+    rm -f -- "$OOM_DROPIN"
+    reloaded=1
+    note "removed $OOM_DROPIN"
+  else
+    note "$OOM_DROPIN is already absent"
+  fi
+  # Only when empty: the drop-in directory may hold fragments this project never wrote.
+  rmdir -- "${OOM_DROPIN%/*}" 2>/dev/null || true
+else
+  note "OOMADJ_BY_US=$OOMADJ_BY_US; leaving $OOM_DROPIN alone"
+fi
+
+if [[ "$SYSCTL_BY_US" == 1 ]]; then
+  if [[ -e "$SYSCTL_FILE" ]]; then
+    rm -f -- "$SYSCTL_FILE"
+    reloaded=1
+    note "removed $SYSCTL_FILE"
+  else
+    note "$SYSCTL_FILE is already absent"
+  fi
+  warn 'removing that file does not reset net.ipv4.ip_forward at runtime; it stays 1 until a reboot or an explicit sysctl -w back to the baseline value'
+else
+  note "SYSCTL_BY_US=$SYSCTL_BY_US; leaving $SYSCTL_FILE alone"
+fi
+
+if [[ "$ZRAM_BY_US" == 1 ]]; then
+  if [[ -e "$ZRAM_FILE" ]]; then
+    rm -f -- "$ZRAM_FILE"
+    reloaded=1
+    note "removed $ZRAM_FILE"
+  else
+    note "$ZRAM_FILE is already absent"
+  fi
+  warn 'the zram device already in use stays until a reboot; this command will not swapoff a 4 GB box mid-teardown'
+else
+  note "ZRAM_BY_US=$ZRAM_BY_US; leaving $ZRAM_FILE alone"
+fi
+
+if [[ "$reloaded" -eq 1 ]]; then
+  systemctl daemon-reload || warn 'systemctl daemon-reload failed'
+fi
+
+step 'Step 7: stop docker, only if we started it'
+if [[ "$DOCKER_ENABLED_BY_US" == 1 ]]; then
+  # Both units: disabling the service alone leaves socket activation to restart
+  # dockerd on the next client call.
+  systemctl disable --now docker.service docker.socket || warn 'systemctl disable --now docker.service docker.socket returned non-zero'
+  note 'docker.service and docker.socket disabled and stopped'
+else
+  note "DOCKER_ENABLED_BY_US=$DOCKER_ENABLED_BY_US; docker.service and docker.socket are left exactly as they were"
+fi
+
+step "Step 8: remove $CONF_DIR and the installed commands"
+rm -rf -- "${CONF_DIR:?}"
+note "removed $CONF_DIR"
+# Unlinking the running script only drops its name: this process keeps its open
+# descriptor, so the remaining steps still run.
+for command_name in "${COMMANDS[@]}"; do
+  if [[ -e "$BIN_DIR/$command_name" ]]; then
+    rm -f -- "$BIN_DIR/$command_name"
+    note "removed $BIN_DIR/$command_name"
+  fi
+done
+
+if [[ "$purge_baselines" -eq 1 ]]; then
+  purged=0
+  for baseline in "$STATE_DIR"/baseline-*; do
+    # An unmatched glob stays literal, and rm -rf on it would abort the teardown here.
+    [[ -e "$baseline" ]] || continue
+    rm -rf -- "$baseline"
+    purged=$((purged + 1))
+  done
+  rmdir -- "$STATE_DIR" 2>/dev/null || true
+  note "removed $purged baseline directories under $STATE_DIR"
+else
+  note "keeping $STATE_DIR/baseline-* - the evidence that nothing else on the box was disturbed. Pass --purge-baselines to remove them."
+fi
+
+step 'Step 9: the data on the array'
+if [[ "$purge_data" -eq 1 ]]; then
+  purge_tree
+else
+  note "--purge-data was not given, so $NC_ROOT is left in place"
+  note "  including ${SQL_OUT##*/} and ${CFG_OUT##*/}, which are the only copies of the database and config.php"
+fi
+
+step 'Step 10: what unavoidably remains'
+cat <<EOF
+(1) The docker system group. Arch's docker package ships
+    /usr/lib/sysusers.d/docker.conf which CREATES the group, but pacman has no
+    hook that deletes system users or groups - the group survives pacman -R.
+    Remove it manually with: groupdel docker
+    and only once nothing owns files with that GID.
+(2) /var/lib/docker and /var/lib/containerd - pacman does not remove them; they
+    must be deleted by hand after the packages are gone.
+(3) The Let's Encrypt certificate and key for ${NC_FQDN:-archnas.<tailnet>.ts.net}
+    cached in /var/lib/tailscale.
+(4) THE PERMANENT ONE: the machine name ${NC_FQDN:-archnas.<tailnet>.ts.net} is in
+    the public Certificate Transparency ledger forever. Nothing undoes that.
+(5) On Corsair: the Nextcloud desktop client
+    (winget uninstall --id Nextcloud.NextcloudDesktop), its sync folder,
+    %LOCALAPPDATA%\Nextcloud, %APPDATA%\Nextcloud\nextcloud.cfg, and its Windows
+    Credential Manager entry.
+(6) The user's files at ${NC_ROOT}/data unless --purge-data was given - deliberate.
+(7) net.ipv4.ip_forward=1 and any FORWARD policy change persist until reboot.
+EOF
+
+step 'Printed, not performed: package removal'
+cat <<'EOF'
+  pacman -R docker docker-compose
+
+Deliberately -R, not -Rns: -s recurses into dependencies and on this box reaches
+containerd, runc and the nftables/iptables providers the host's own networking
+depends on. On a headless tailnet-only NAS an unreviewed cascading removal is the
+wrong default. Review the leftovers yourself afterwards with: pacman -Qdtq
+EOF
+
+step 'Printed, not performed: the reboot'
+cat <<'EOF'
+A reboot is what actually clears the leftover DOCKER/DOCKER-USER chains, the
+docker0 bridge and the runtime net.ipv4.ip_forward=1. Before you reboot, check:
+
+  systemctl is-enabled tailscaled
+  the tailnet node key is not expired - an expired key after reboot is
+    indistinguishable from a dead box and needs physical access
+  the bootloader has a previous-kernel entry
+EOF

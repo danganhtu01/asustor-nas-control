@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+# nextcloud-lib - sourced helper library for the nextcloud-trial commands.
+#
+#   source /usr/local/bin/nextcloud-lib
+#
+# Public contract. Nothing else here is public and nothing is added to this
+# list: the other nextcloud-* commands are written against it in parallel.
+#
+#   die CHECK FOUND EXPECTED FIX    four lines on stderr, then exit 1
+#   warn MESSAGE...                 one 'warn:' line on stderr, returns 0
+#   note MESSAGE...                 one plain line on stdout, for report output
+#   nearest_existing PATH           first existing ancestor of PATH
+#   free_bytes PATH                 bytes available on the fs holding PATH
+#   used_pct PATH                   percent used of that fs, integer, no '%'
+#   mnt_of PATH                     mountpoint of that fs
+#   fstype_of PATH                  fstype of that fs
+#   src_of PATH                     backing source of that fs
+#   path_is_within CHILD PARENT     0 if CHILD is PARENT or below it, else 1
+#   cnc_get CONF KEY [OWNER_HOME]   one value out of cloud-nas.conf
+#   run_user_systemctl ARGS...      systemctl --user on $NC_OWNER's manager
+#   gen_secret                      32 random alphanumerics on stdout
+#   require_conf                    load /etc/nextcloud-trial/nextcloud-trial.conf
+#
+# What callers need to know:
+#   - The five filesystem helpers accept a path that does not exist yet; each
+#     resolves through nearest_existing first. Each prints one line and returns
+#     0, or prints nothing and returns 1. Under 'set -e' a bare
+#     x=$(mnt_of "$p") therefore aborts on failure, which is usually right;
+#     write x=$(mnt_of "$p" || true) only where 'unknown' is an acceptable answer.
+#   - cnc_get returns 1 when the key is merely absent, but calls die when the
+#     value is unsafe. Never write v=$(cnc_get ... || true): that swallows the
+#     refusal and leaves the containment guard silently unarmed.
+#   - run_user_systemctl needs NC_OWNER and NC_OWNER_UID. require_conf derives
+#     NC_OWNER_UID from NC_OWNER; nextcloud-preflight sets both itself.
+#   - After require_conf every key nextcloud-install writes is set - empty if it
+#     was not written, 0 for the *_BY_US flags - so callers may read them under
+#     'set -u' without guards. Only NC_ROOT and NC_PROJECT must be non-empty.
+
+[ "${BASH_SOURCE[0]}" != "$0" ] || { echo 'nextcloud-lib is a library; source it' >&2; exit 1; }
+
+die() {
+  printf 'error: %s\n' "${1:-a check failed}" >&2
+  printf '  found:    %s\n' "${2:-unknown}" >&2
+  printf '  expected: %s\n' "${3:-unknown}" >&2
+  printf '  fix:      %s\n' "${4:-no fix recorded; report this}" >&2
+  exit 1
+}
+
+warn() {
+  printf 'warn: %s\n' "$*" >&2
+}
+
+note() {
+  printf '%s\n' "$*"
+}
+
+# Walks up to the first ancestor that exists, so findmnt and df can be asked
+# about NC_ROOT before NC_ROOT has been created.
+nearest_existing() {
+  local p
+  [[ -n "${1:-}" ]] || die \
+    'nearest_existing called with an empty path' \
+    'no argument, or an empty one' \
+    'one path, absolute or relative' \
+    "fix the caller: readlink -m '' resolves to the current directory, so an empty path would silently be answered for the wrong filesystem"
+  p=$(readlink -m -- "$1")
+  while [[ ! -e "$p" ]]; do
+    [[ "$p" != / ]] || break
+    p=${p%/*}
+    [[ -n "$p" ]] || p=/
+  done
+  printf '%s\n' "$p"
+}
+
+free_bytes() {
+  local target out
+  target=$(nearest_existing "${1:-}")
+  out=$(df -P -B1 -- "$target" 2>/dev/null | awk 'NR == 2 { print $4 }' || true)
+  [[ "$out" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$out"
+}
+
+used_pct() {
+  local target out
+  target=$(nearest_existing "${1:-}")
+  out=$(df -P -B1 -- "$target" 2>/dev/null | awk 'NR == 2 { sub(/%$/, "", $5); print $5 }' || true)
+  [[ "$out" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "$out"
+}
+
+# The three findmnt helpers take the first row by parameter expansion rather
+# than by piping into head, which would return 141 under pipefail.
+mnt_of() {
+  local target out
+  target=$(nearest_existing "${1:-}")
+  out=$(findmnt -n -o TARGET --target "$target" 2>/dev/null || true)
+  out=${out%%$'\n'*}
+  [[ -n "$out" ]] || return 1
+  printf '%s\n' "$out"
+}
+
+fstype_of() {
+  local target out
+  target=$(nearest_existing "${1:-}")
+  out=$(findmnt -n -o FSTYPE --target "$target" 2>/dev/null || true)
+  out=${out%%$'\n'*}
+  [[ -n "$out" ]] || return 1
+  printf '%s\n' "$out"
+}
+
+src_of() {
+  local target out
+  target=$(nearest_existing "${1:-}")
+  out=$(findmnt -n -o SOURCE --target "$target" 2>/dev/null || true)
+  out=${out%%$'\n'*}
+  [[ -n "$out" ]] || return 1
+  printf '%s\n' "$out"
+}
+
+# Refuses rather than answering 'not contained' for input it cannot resolve:
+# this is the guard that keeps Nextcloud out of the rclone mirror, and a guard
+# that cannot be evaluated must never read as a pass.
+path_is_within() {
+  local c p
+  [[ -n "${1:-}" && -n "${2:-}" ]] || die \
+    'path_is_within called with an empty path' \
+    "child='${1:-}' parent='${2:-}'" \
+    'two non-empty paths' \
+    'fix the caller; a containment test that cannot be evaluated must not be treated as "not contained"'
+  c=$(readlink -m -- "$1")
+  p=$(readlink -m -- "$2")
+  p=${p%/}
+  case "$c/" in
+    "$p"/*) return 0 ;;
+  esac
+  return 1
+}
+
+cnc_get() {
+  local conf=${1:-} key=${2:-} home=${3:-${NC_OWNER_HOME:-}}
+  local line value
+
+  [[ -n "$conf" && -n "$key" ]] || die \
+    'cnc_get called without both a config path and a key' \
+    "conf='$conf' key='$key'" \
+    'cnc_get CONF KEY [OWNER_HOME]' \
+    'fix the caller; pass the owner-resolved config path, never a bare ~ (this process is root, so ~ is /root)'
+  [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die \
+    'cnc_get called with a key that is not a shell variable name' \
+    "key='$key'" \
+    'a name matching [A-Za-z_][A-Za-z0-9_]*' \
+    'fix the caller; the key is interpolated into a grep pattern'
+
+  [[ -r "$conf" ]] || return 1
+
+  line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" -- "$conf" 2>/dev/null | tail -n 1 || true)
+  [[ -n "$line" ]] || return 1
+
+  value=${line#*=}
+  value=${value#"${value%%[![:space:]]*}"}
+  case "$value" in
+    \"*) value=${value#\"}; value=${value%%\"*} ;;
+    \'*) value=${value#\'}; value=${value%%\'*} ;;
+    *)   value=${value%%[[:space:]]*} ;;
+  esac
+
+  # The literals must NOT expand here: they are being matched inside untrusted
+  # config text, not evaluated.
+  # shellcheck disable=SC2088,SC2016
+  case "$value" in
+    '~/'*)     value="${home%/}/${value#\~/}" ;;
+    '$HOME/'*) value="${home%/}/${value#\$HOME/}" ;;
+  esac
+
+  case "$value" in
+    *'$'* | *'`'*)
+      die \
+        "cloud-nas.conf sets ${key}=${value}, which contains an unresolved shell expansion" \
+        "$conf: $line" \
+        'a literal path containing no $ and no backtick' \
+        'This script will not source that file - it is owner-writable and this process is root. Pass the literal resolved path with --guard=/mnt/...'
+      ;;
+  esac
+
+  printf '%s\n' "$value"
+}
+
+# Never a bare 'systemctl --user': after the sudo re-exec that queries root's
+# user manager and reports a false all-clear for the cloud-nas timers.
+run_user_systemctl() {
+  local owner=${NC_OWNER:-} uid=${NC_OWNER_UID:-}
+  [[ -n "$owner" && "$uid" =~ ^[0-9]+$ ]] || die \
+    "checked NC_OWNER and NC_OWNER_UID before querying the owner's systemd user manager" \
+    "NC_OWNER='$owner' NC_OWNER_UID='$uid'" \
+    'a username and its numeric uid' \
+    'call require_conf first, or set both from SUDO_USER before calling this'
+  sudo -u "$owner" \
+    "XDG_RUNTIME_DIR=/run/user/$uid" \
+    "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
+    systemctl --user "$@"
+}
+
+# dd terminates the read instead of head, but tr still takes SIGPIPE when dd
+# closes the pipe, so the 141 is absorbed here and the length is verified
+# instead. Alphanumerics only: a '$' in a password is interpolated by Compose.
+gen_secret() {
+  local secret
+  secret=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | dd bs=1 count=32 2>/dev/null || true)
+  [[ ${#secret} -eq 32 ]] || die \
+    'checked that 32 random alphanumerics could be read from /dev/urandom' \
+    "got ${#secret} characters" \
+    '32 characters' \
+    'check that /dev/urandom is readable and that coreutils tr and dd are present'
+  printf '%s\n' "$secret"
+}
+
+require_conf() {
+  local conf=/etc/nextcloud-trial/nextcloud-trial.conf
+  local ownership mode
+
+  [[ -f "$conf" ]] || die \
+    "checked for the installer state file at $conf" \
+    'no such file' \
+    'the file nextcloud-install writes with NC_ROOT, NC_PROJECT and the *_BY_US flags' \
+    'run nextcloud-install first; nothing here re-derives that state, and guessing it is how the wrong tree gets deleted'
+
+  ownership=$(stat -c '%u:%g' -- "$conf")
+  mode=$(stat -c '%a' -- "$conf")
+  [[ "$ownership" == 0:0 && "$mode" == 600 ]] || die \
+    "checked that $conf is root-owned and mode 0600 before loading it" \
+    "owner uid:gid $ownership, mode $mode" \
+    'owner 0:0, mode 600' \
+    "restore it with: chown root:root $conf && chmod 600 $conf - this file is sourced, so anyone who can write it runs code as root"
+
+  # Sourced, unlike cloud-nas.conf, because nextcloud-install is its only
+  # writer and the ownership and mode were just proven.
+  # shellcheck disable=SC1090
+  source "$conf"
+
+  [[ -n "${NC_ROOT:-}" && -n "${NC_PROJECT:-}" ]] || die \
+    "checked that $conf names the tree and the compose project" \
+    "NC_ROOT='${NC_ROOT:-}' NC_PROJECT='${NC_PROJECT:-}'" \
+    'both set and non-empty' \
+    'the file is truncated or hand-edited; restore it from a baseline or re-run nextcloud-install'
+  [[ "$NC_ROOT" == /?* ]] || die \
+    'checked that NC_ROOT is an absolute path below the root directory' \
+    "NC_ROOT='$NC_ROOT'" \
+    'an absolute path that is not /' \
+    'correct NC_ROOT in the state file by hand; every teardown path is built from it'
+
+  : "${NC_OWNER:=}"
+  : "${NC_HTTP_PORT:=}"
+  : "${NC_SUBNET:=}"
+  : "${NC_FQDN:=}"
+  : "${NC_TSIP:=}"
+  : "${NC_IMAGE:=}"
+  : "${DB_IMAGE:=}"
+  : "${REDIS_IMAGE:=}"
+  : "${RAM_PROFILE:=}"
+  : "${BASELINE_DIR:=}"
+  : "${DOCKER_ENABLED_BY_US:=0}"
+  : "${TS_SERVE_SET_BY_US:=0}"
+  : "${ZRAM_BY_US:=0}"
+  : "${SYSCTL_BY_US:=0}"
+  : "${OOMADJ_BY_US:=0}"
+  : "${NC_OWNER_HOME:=}"
+  : "${NC_OWNER_UID:=}"
+
+  if [[ -n "$NC_OWNER" ]]; then
+    [[ -n "$NC_OWNER_HOME" ]] || NC_OWNER_HOME=$(getent passwd "$NC_OWNER" 2>/dev/null | cut -d: -f6 || true)
+    [[ -n "$NC_OWNER_UID" ]] || NC_OWNER_UID=$(getent passwd "$NC_OWNER" 2>/dev/null | cut -d: -f3 || true)
+  fi
+}

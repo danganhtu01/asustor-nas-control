@@ -341,3 +341,36 @@ root-owned sysfs files such as:
 ```text
 /sys/devices/platform/asustor_it87.*/hwmon/hwmon*/pwm1
 ```
+
+## Nextcloud trial
+
+An optional, self-contained Nextcloud instance in Docker, reachable only over the
+tailnet, installed and removed by scripts in this repo. It is a trial rig, not
+production infrastructure. Read `docs/nextcloud-trial.md` before running any of
+it — it carries the decision record, the memory profiles, and the Windows-side
+setup.
+
+`nextcloud-preflight` is read-only and is the correct first thing to run. It
+writes nothing outside `/var/lib/nextcloud-trial/` and will tell you what it
+would refuse on.
+
+| Command | Mutates? | Purpose |
+|---|---|---|
+| `nextcloud-preflight` | no | Discovery, refusals, and a text-only baseline |
+| `nextcloud-install` | **yes** | The only mutating script; runs preflight first and aborts on failure |
+| `nextcloud-status` | no | Containers, certificate expiry, free space, cloud-nas timers, asustor modules |
+| `nextcloud-occ` | yes | `occ` wrapper, e.g. `nextcloud-occ status` |
+| `nextcloud-postflight` | no | Diffs against the baseline to assert nothing was disturbed |
+| `nextcloud-uninstall` | **yes** | Teardown; refuses unless it owns the tree |
+
+```bash
+sudo ./scripts/install.sh
+nextcloud-preflight --root /srv/nextcloud
+```
+
+Two things worth knowing before you start. The installer never touches
+`/etc/docker/daemon.json`, because Docker 29's containerd image store keeps image
+data in `/var/lib/containerd` where `data-root` does not reach. And Docker
+installation is a separate opt-in (`--install-docker --i-understand-kernel-risk`,
+inside `tmux`) because `pacman -Syu` can pull a kernel that breaks the
+hand-built asustor modules and can restart `tailscaled` under your SSH session.

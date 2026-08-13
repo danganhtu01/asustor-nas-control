@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROGRAM=${0##*/}
+DEFAULT_THRESHOLD=85
+# Tailscale documents automatic renewal only for its Caddy integration, never
+# for serve, so the certificate is something this report watches rather than
+# something it trusts.
+CERT_WARN_DAYS=21
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  nextcloud-status [--threshold <1-100>]
+
+Read-only health report for the nextcloud-trial stack. Changes nothing.
+
+Options:
+  --threshold <1-100>  fail above this filesystem usage (default: 85)
+  -h, --help           show this help
+
+Exit status:
+  0  every filesystem below the threshold and every container running healthy
+  1  a filesystem is above the threshold, unreadable, or a container is not
+USAGE
+}
+
+# Answered before the sudo re-exec so --help never asks for a password.
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help|help) usage; exit 0 ;;
+  esac
+done
+
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  exec sudo -- "$0" "$@"
+fi
+
+if [[ ! -r /usr/local/bin/nextcloud-lib ]]; then
+  printf 'error: checked for the helper library at /usr/local/bin/nextcloud-lib\n' >&2
+  printf '  found:    no readable file at that path\n' >&2
+  printf '  expected: the library installed beside the other nextcloud-* commands\n' >&2
+  printf '  fix:      re-run ./scripts/install.sh from the repo checkout\n' >&2
+  exit 1
+fi
+
+# shellcheck source=/dev/null
+source /usr/local/bin/nextcloud-lib
+
+threshold=$DEFAULT_THRESHOLD
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --threshold)
+      [[ $# -ge 2 ]] || die \
+        'checked that --threshold was given a value' \
+        'the flag was the last word on the command line' \
+        '--threshold <1-100>' \
+        "run '$PROGRAM --help'"
+      threshold=$2
+      shift 2
+      ;;
+    --threshold=*)
+      threshold=${1#*=}
+      shift
+      ;;
+    *)
+      die \
+        'checked the command line for a recognised option' \
+        "unknown argument '$1'" \
+        '--threshold <1-100>, or no arguments at all' \
+        "run '$PROGRAM --help'; this command takes no positional arguments"
+      ;;
+  esac
+done
+
+[[ "$threshold" =~ ^([1-9]|[1-9][0-9]|100)$ ]] || die \
+  'checked that --threshold is a whole percentage' \
+  "--threshold '$threshold'" \
+  'an integer from 1 to 100' \
+  'pass something like --threshold 85'
+
+require_conf
+
+rc=0
+problems=()
+fs_checked=0
+containers_running=0
+
+section() {
+  printf '\n== %s ==\n' "$1"
+}
+
+fail() {
+  rc=1
+  problems+=("$*")
+  printf 'FAIL: %s\n' "$*"
+}
+
+# Sizes are formatted here rather than by asking df -h a second time, so every
+# number in the report comes from the one set of library helpers.
+human_bytes() {
+  local b=${1:-0}
+  if (( b >= 1099511627776 )); then
+    printf '%d.%01d TiB\n' $(( b / 1099511627776 )) $(( b % 1099511627776 * 10 / 1099511627776 ))
+  elif (( b >= 1073741824 )); then
+    printf '%d.%01d GiB\n' $(( b / 1073741824 )) $(( b % 1073741824 * 10 / 1073741824 ))
+  elif (( b >= 1048576 )); then
+    printf '%d MiB\n' $(( b / 1048576 ))
+  else
+    printf '%d B\n' "$b"
+  fi
+}
+
+report_fs() {
+  local label=$1 path=$2
+  local mnt fstype pct free_b
+
+  fs_checked=$(( fs_checked + 1 ))
+  printf '  %-20s %s\n' "$label" "$path"
+
+  mnt=$(mnt_of "$path" || true)
+  fstype=$(fstype_of "$path" || true)
+  pct=$(used_pct "$path" || true)
+  free_b=$(free_bytes "$path" || true)
+
+  if [[ "$pct" =~ ^[0-9]+$ && "$free_b" =~ ^[0-9]+$ ]]; then
+    printf '  %-20s %s%% used, %s free  (mount %s, %s)\n' \
+      '' "$pct" "$(human_bytes "$free_b")" "${mnt:-unknown}" "${fstype:-unknown}"
+    if (( pct > threshold )); then
+      fail "$label ($path) is ${pct}% used on ${mnt:-unknown}, above the ${threshold}% threshold"
+    fi
+  else
+    # Unreadable counts as a failure, not as a pass: a check that could not be
+    # evaluated must never read like one that succeeded.
+    printf '  %-20s usage could not be read\n' ''
+    fail "$label ($path): df and findmnt did not answer, so its usage is unverified"
+  fi
+}
+
+docker_ready=0
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  docker_ready=1
+fi
+
+section "Instance"
+printf 'project:   %s\n' "$NC_PROJECT"
+printf 'root:      %s\n' "$NC_ROOT"
+printf 'fqdn:      %s\n' "${NC_FQDN:-not recorded}"
+printf 'publish:   127.0.0.1:%s\n' "${NC_HTTP_PORT:-not recorded}"
+printf 'ram:       %s\n' "${RAM_PROFILE:-not recorded}"
+printf 'images:    %s %s %s\n' "${NC_IMAGE:-?}" "${DB_IMAGE:-?}" "${REDIS_IMAGE:-?}"
+printf 'owner:     %s\n' "${NC_OWNER:-not recorded}"
+
+section "Stack"
+if (( docker_ready == 1 )); then
+  if [[ -r "$NC_ROOT/compose.yaml" ]]; then
+    docker compose -f "$NC_ROOT/compose.yaml" --project-name "$NC_PROJECT" ps || true
+  else
+    warn "no readable compose file at $NC_ROOT/compose.yaml, so only the label sweep below can describe this stack"
+  fi
+
+  # The verdict is taken from the project label rather than from compose, which
+  # fails outright when the .env is missing or a variable is unset.
+  containers=$(docker ps -a --filter "label=com.docker.compose.project=$NC_PROJECT" \
+    --format '{{.Names}}|{{.State}}|{{.Status}}' 2>/dev/null || true)
+  if [[ -z "$containers" ]]; then
+    fail "no container carries the label com.docker.compose.project=$NC_PROJECT"
+  else
+    while IFS='|' read -r cname cstate cstatus; do
+      [[ -n "$cname" ]] || continue
+      case "$cstatus" in
+        *'(unhealthy)'*)
+          fail "container $cname reports unhealthy: $cstatus"
+          ;;
+        *)
+          if [[ "$cstate" == running ]]; then
+            containers_running=$(( containers_running + 1 ))
+          else
+            fail "container $cname is $cstate: $cstatus"
+          fi
+          ;;
+      esac
+    done <<<"$containers"
+  fi
+else
+  fail 'the Docker daemon did not answer, so no container in this project can be reported healthy'
+fi
+
+section "Docker Service"
+printf 'docker.service enabled: %s\n' "$(systemctl is-enabled docker.service 2>/dev/null || true)"
+printf 'docker.service active:  %s\n' "$(systemctl is-active docker.service 2>/dev/null || true)"
+printf 'docker.socket  enabled: %s\n' "$(systemctl is-enabled docker.socket 2>/dev/null || true)"
+if ! systemctl is-enabled --quiet docker.service 2>/dev/null; then
+  warn 'docker.service is not enabled at boot. With only docker.socket enabled the daemon starts on the first client call, not at boot, so restart:unless-stopped containers do NOT come back after an unattended reboot.'
+fi
+
+section "Tailscale Serve"
+if command -v tailscale >/dev/null 2>&1; then
+  tailscale serve status || true
+else
+  warn 'tailscale is not on PATH; the HTTPS front end cannot be reported from here'
+fi
+
+section "Certificate"
+if [[ -z "$NC_FQDN" ]]; then
+  warn "no NC_FQDN in the installer state file; skipping the certificate check"
+elif ! command -v openssl >/dev/null 2>&1; then
+  warn 'openssl is not installed; skipping the certificate expiry check'
+else
+  printf 'host: %s\n' "$NC_FQDN"
+  enddate=$(openssl s_client -connect "${NC_FQDN}:443" </dev/null 2>/dev/null | openssl x509 -noout -enddate || true)
+  if [[ "$enddate" == notAfter=* ]]; then
+    printf '%s\n' "$enddate"
+    cert_end=$(date -d "${enddate#notAfter=}" +%s 2>/dev/null || true)
+    if [[ "$cert_end" =~ ^[0-9]+$ ]]; then
+      cert_days=$(( (cert_end - $(date +%s)) / 86400 ))
+      printf 'days left: %s\n' "$cert_days"
+      if (( cert_days < CERT_WARN_DAYS )); then
+        warn "the served certificate expires in ${cert_days} days and has not been renewed yet; check 'tailscale serve status' and the tailnet HTTPS setting before it lapses"
+      fi
+    fi
+  else
+    warn "could not read a certificate from ${NC_FQDN}:443; either tailscale serve is not running or the tailnet is down"
+  fi
+fi
+
+section "Nextcloud Endpoints"
+if [[ -z "$NC_FQDN" ]]; then
+  warn 'no NC_FQDN in the installer state file; skipping the HTTPS probes'
+elif ! command -v curl >/dev/null 2>&1; then
+  warn 'curl is not installed; skipping the HTTPS probes'
+else
+  status_body=$(curl -fsS "https://${NC_FQDN}/status.php" || true)
+  if [[ -n "$status_body" ]]; then
+    printf 'status.php: %s\n' "$status_body"
+  else
+    warn "https://${NC_FQDN}/status.php did not answer"
+  fi
+
+  # This is the Windows-client predictor: Login Flow v2 aborts in the client
+  # when the poll endpoint comes back as http:// on an https:// login.
+  flow=$(curl -fsS -X POST "https://${NC_FQDN}/index.php/login/v2" || true)
+  endpoint=$(printf '%s' "$flow" | grep -o '"endpoint"[[:space:]]*:[[:space:]]*"[^"]*"' | tail -n 1 || true)
+  if [[ -n "$endpoint" ]]; then
+    endpoint=${endpoint#*\"endpoint\"}
+    endpoint=${endpoint#*\"}
+    endpoint=${endpoint%\"}
+    endpoint=${endpoint//'\/'//}
+  fi
+  case "$endpoint" in
+    https://*)
+      printf 'login/v2 poll endpoint: %s\n' "$endpoint"
+      printf 'login/v2 verdict: https, the desktop client will complete Login Flow v2\n'
+      ;;
+    '')
+      warn "https://${NC_FQDN}/index.php/login/v2 returned no poll endpoint; do not touch Windows until it does"
+      ;;
+    *)
+      printf 'login/v2 poll endpoint: %s\n' "$endpoint"
+      warn "the poll endpoint is not https. The desktop client will abort with 'The returned server URL does not start with HTTPS despite the login URL started with HTTPS...' and it will look like a certificate fault. Check overwriteprotocol, overwritehost and trusted_proxies with nextcloud-occ config:list system"
+      ;;
+  esac
+fi
+
+section "Filesystems"
+report_fs NC_ROOT "$NC_ROOT"
+# One filesystem covers both Docker stores: on Docker 29 the images land in
+# /var/lib/containerd, which data-root does not move.
+report_fs 'docker store' /var/lib
+if [[ -z "${NC_OWNER_HOME:-}" ]]; then
+  warn 'no owner home recorded, so cloud-nas.conf cannot be located; the pipeline volumes are NOT covered by this report'
+else
+  cnc="${NC_OWNER_HOME%/}/.config/cloud-nas/cloud-nas.conf"
+  if [[ ! -r "$cnc" ]]; then
+    warn "no readable cloud-nas config at $cnc; the pipeline volumes are NOT covered by this report"
+  else
+    for key in NAS02_MOUNT NAS03_MOUNT NAS03_TARGET NAS02_BACKUP_ROOT CLOUD_NAS_STATE_DIR; do
+      # cnc_get refuses loudly on a value it cannot resolve without sourcing an
+      # owner-writable file as root, so a miss here is 'absent or refused', and
+      # the four-line refusal is on stderr immediately above.
+      if value=$(cnc_get "$cnc" "$key" "$NC_OWNER_HOME"); then
+        report_fs "$key" "$value"
+      else
+        printf '  %-20s not set in the config, or refused above\n' "$key"
+      fi
+    done
+  fi
+fi
+
+section "Docker Disk Usage"
+if (( docker_ready == 1 )); then
+  docker system df || true
+else
+  printf 'docker daemon unavailable\n'
+fi
+
+section "Memory"
+free -m || true
+if (( docker_ready == 1 )); then
+  # Scoped to the project label so the report never accounts for containers
+  # this stack does not own.
+  mapfile -t stat_ids < <(docker ps -q --filter "label=com.docker.compose.project=$NC_PROJECT" 2>/dev/null || true)
+  if (( ${#stat_ids[@]} > 0 )); then
+    docker stats --no-stream "${stat_ids[@]}" || true
+  fi
+fi
+
+section "Cloud NAS Timers"
+if [[ -n "${NC_OWNER:-}" && "${NC_OWNER_UID:-}" =~ ^[0-9]+$ ]]; then
+  # Never a bare systemctl --user here: after the sudo re-exec that would query
+  # root's manager and report a false all-clear for the owner's timers.
+  run_user_systemctl list-timers 'cloud-nas*' --all --no-pager || true
+else
+  warn "cannot query the owner's systemd user manager: NC_OWNER='${NC_OWNER:-}' NC_OWNER_UID='${NC_OWNER_UID:-}'"
+fi
+
+section "ASUSTOR Platform"
+platform_modules=$(lsmod | grep -E '^(asustor|asustor_it87|asustor_gpio_it87|leds_gpio|gpio_keys_polled) ' || true)
+module_count=0
+if [[ -n "$platform_modules" ]]; then
+  printf '%s\n' "$platform_modules"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    module_count=$(( module_count + 1 ))
+  done <<<"$platform_modules"
+fi
+if (( module_count != 5 )); then
+  warn "Expected 5 asustor platform modules, found ${module_count}. Nextcloud does not need them, but their absence means fan and LED control is already broken."
+fi
+
+# Matched on the chip name, never on the hwmon index: hwmon3 can become hwmon2
+# after any reboot.
+hwmon_found=0
+for hwmon_name in /sys/devices/platform/asustor_it87.*/hwmon/hwmon*/name; do
+  [[ -e "$hwmon_name" ]] || continue
+  chip=$(cat "$hwmon_name" 2>/dev/null || true)
+  case "$chip" in
+    it8625)
+      hwmon_found=1
+      printf 'hwmon: %s (%s)\n' "${hwmon_name%/name}" "$chip"
+      ;;
+    *)
+      printf 'hwmon: %s (%s, expected it8625)\n' "${hwmon_name%/name}" "${chip:-unreadable}"
+      ;;
+  esac
+done
+if (( hwmon_found == 0 )); then
+  warn 'asustor_it87 hwmon reporting it8625 was not found under /sys/devices/platform/asustor_it87.*/hwmon/hwmon*/name; fan and temperature readback is gone'
+fi
+
+section "Summary"
+if (( ${#problems[@]} == 0 )); then
+  printf 'OK: %d container(s) running, %d filesystem(s) at or below %d%%\n' \
+    "$containers_running" "$fs_checked" "$threshold"
+else
+  printf '%d problem(s):\n' "${#problems[@]}"
+  for problem in "${problems[@]}"; do
+    printf '  - %s\n' "$problem"
+  done
+fi
+
+exit "$rc"

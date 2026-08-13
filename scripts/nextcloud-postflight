@@ -1,0 +1,876 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# nextcloud-postflight - read-only. Diffs the running box against the newest
+# baseline nextcloud-preflight recorded, so that "the Nextcloud trial disturbed
+# nothing" is an assertion that either holds or names exactly what moved.
+
+PROGRAM=${0##*/}
+BASELINE_ROOT=/var/lib/nextcloud-trial
+STATE_CONF=/etc/nextcloud-trial/nextcloud-trial.conf
+
+# Space is never a hard failure here, but a filesystem that gained this many
+# points, or that now sits this full, is worth saying out loud.
+GROW_WARN_PCT=5
+FULL_WARN_PCT=85
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  nextcloud-postflight [--baseline DIR] [--owner USER] [--no-rclone]
+
+Read-only. Diffs the running box against the newest baseline written by
+nextcloud-preflight under /var/lib/nextcloud-trial/ and exits non-zero when
+something that was promised to stay untouched has changed.
+
+Hard failures (exit 1):
+  an asustor, leds_gpio or gpio_keys_polled module the baseline recorded and
+  the box no longer has; the asustor_it87 hwmon glob resolving to nothing; any
+  change to the owner's systemd user unit files; sshd not active;
+  acpi_enforce_resources=lax lost from /proc/cmdline; the live rclone read
+  failing.
+
+Warnings only:
+  mount-table changes, IP forwarding and the iptables FORWARD policy differing
+  from the recorded baseline value, and free-space deltas.
+
+Options:
+  --baseline DIR   diff against this baseline instead of the newest one
+  --owner USER     cloud-nas pipeline owner; default is NC_OWNER from the
+                   installer state file, else $SUDO_USER
+  --no-rclone      skip the live outbound rclone read
+  -h, --help       this text
+USAGE
+}
+
+# Answered before the sudo re-exec so that --help never asks for a password.
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+  esac
+done
+
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  exec sudo -- "$0" "$@"
+fi
+
+nc_lib=""
+for candidate in "$(dirname -- "$(readlink -f -- "$0")")/nextcloud-lib" /usr/local/bin/nextcloud-lib; do
+  [[ -r "$candidate" ]] || continue
+  nc_lib=$candidate
+  break
+done
+if [[ -z "$nc_lib" ]]; then
+  printf 'error: looked for nextcloud-lib beside this script and in /usr/local/bin\n' >&2
+  printf '  found:    no readable nextcloud-lib\n' >&2
+  printf '  expected: the helper library every nextcloud-* command sources\n' >&2
+  printf '  fix:      run ./scripts/install.sh from the repository checkout\n' >&2
+  exit 1
+fi
+# shellcheck source=/dev/null
+source "$nc_lib"
+
+BASELINE=""
+BASELINE_OVERRIDE=""
+OWNER_OVERRIDE=""
+CONF_LOADED=0
+DO_RCLONE=1
+FAILURES=0
+WARNINGS=0
+TMP=""
+
+section() {
+  printf '\n== %s ==\n' "$1"
+}
+
+# Same four lines as die(), but this command is read-only and its whole value is
+# one complete picture per run, so every check gets to speak before the exit.
+fail() {
+  FAILURES=$((FAILURES + 1))
+  printf 'FAIL: %s\n' "${1:-a check failed}" >&2
+  printf '  found:    %s\n' "${2:-unknown}" >&2
+  printf '  expected: %s\n' "${3:-unknown}" >&2
+  printf '  fix:      %s\n' "${4:-no fix recorded; report this}" >&2
+}
+
+soft() {
+  WARNINGS=$((WARNINGS + 1))
+  warn "$@"
+}
+
+first_line() {
+  local line=""
+  [[ -r "${1:-}" ]] || { printf '%s\n' "${2:-}"; return 0; }
+  IFS= read -r line <"$1" || true
+  printf '%s\n' "${line:-${2:-}}"
+}
+
+hbytes() {
+  local n=${1:-}
+  [[ "$n" =~ ^[0-9]+$ ]] || { printf 'unknown\n'; return 0; }
+  # iec-i, so 93GiB never reads as the decimal 93GB the spec's thresholds are not
+  # written in.
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --to=iec-i --suffix=B -- "$n" 2>/dev/null || printf '%s\n' "$n"
+  else
+    printf '%s\n' "$n"
+  fi
+}
+
+# Both sides of every diff go through this. The baseline may have been captured
+# with different pagination or column flags than this process uses, and
+# findmnt -R draws a tree whose box-drawing prefix shifts whenever the tree
+# does; without normalising, formatting would read as a change.
+norm_stream() {
+  LC_ALL=C awk '
+    { gsub(/\t/, " ") }
+    { sub(/^[^!-~]+/, "") }
+    { gsub(/  +/, " ") }
+    { sub(/ +$/, "") }
+    $0 == "" { next }
+    /^[0-9]+ unit files listed\.$/ { next }
+    /^UNIT FILE / { next }
+    { print }
+  '
+}
+
+# Searched by pattern rather than by exact name: nextcloud-preflight owns the
+# baseline layout, and a hard check that silently found no input would read as a
+# pass. Two levels deep so a preflight that groups its captures still resolves.
+baseline_file() {
+  local pat f
+  for pat in "$@"; do
+    while IFS= read -r f; do
+      [[ -n "$f" && -r "$f" ]] || continue
+      printf '%s\n' "$f"
+      return 0
+    done < <(find "$BASELINE" -maxdepth 2 -type f -name "$pat" 2>/dev/null | LC_ALL=C sort)
+  done
+  return 1
+}
+
+capture() {
+  local out=$1
+  shift
+  : >"$out"
+  "$@" >"$out" 2>/dev/null || true
+}
+
+only_in_first() {
+  comm -23 <(norm_stream <"$1" | LC_ALL=C sort -u) <(norm_stream <"$2" | LC_ALL=C sort -u)
+}
+
+only_in_second() {
+  comm -13 <(norm_stream <"$1" | LC_ALL=C sort -u) <(norm_stream <"$2" | LC_ALL=C sort -u)
+}
+
+# As the owner, with the owner's HOME: sudo's env_reset leaves HOME=/root, and
+# rclone would then look for a config that is not there and report an empty
+# remote list as though the pipeline had been dismantled.
+owner_run() {
+  sudo -u "$NC_OWNER" "HOME=$NC_OWNER_HOME" "$@"
+}
+
+is_asustor_led() {
+  case "$1" in
+    blue:lan|blue:power|green:status|green:usb|power:front_panel|power:lcd|red:power|red:status|sata*:green:disk|sata*:red:disk)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+parse_args() {
+  while (( $# > 0 )); do
+    case "$1" in
+      --baseline=*)
+        BASELINE_OVERRIDE=${1#*=}
+        shift
+        ;;
+      --baseline)
+        [[ $# -ge 2 ]] || die \
+          'checked that --baseline was given a directory' \
+          '--baseline with no value after it' \
+          '--baseline /var/lib/nextcloud-trial/baseline-YYYYmmddTHHMMSSZ' \
+          "run '$PROGRAM --help'"
+        BASELINE_OVERRIDE=$2
+        shift 2
+        ;;
+      --owner=*)
+        OWNER_OVERRIDE=${1#*=}
+        shift
+        ;;
+      --owner)
+        [[ $# -ge 2 ]] || die \
+          'checked that --owner was given a username' \
+          '--owner with no value after it' \
+          '--owner <the user who owns the cloud-nas pipeline>' \
+          "run '$PROGRAM --help'"
+        OWNER_OVERRIDE=$2
+        shift 2
+        ;;
+      --no-rclone)
+        DO_RCLONE=0
+        shift
+        ;;
+      *)
+        die \
+          'checked the command line against the flags this command accepts' \
+          "unknown argument '$1'" \
+          '--baseline DIR, --owner USER, --no-rclone or --help' \
+          "run '$PROGRAM --help'; this command takes no positional arguments"
+        ;;
+    esac
+  done
+}
+
+resolve_owner() {
+  : "${NC_OWNER:=}"
+  : "${NC_OWNER_UID:=}"
+  : "${NC_OWNER_HOME:=}"
+  : "${NC_ROOT:=}"
+  : "${BASELINE_DIR:=}"
+
+  # Optional on purpose: the reboot test happens before there is any Nextcloud
+  # data, and the module, unit-file and rclone assertions are worth running then
+  # too. Only NC_ROOT-specific reporting needs the installer's state.
+  if [[ -f "$STATE_CONF" ]]; then
+    require_conf
+    CONF_LOADED=1
+  else
+    CONF_LOADED=0
+  fi
+
+  if [[ -n "$OWNER_OVERRIDE" ]]; then
+    NC_OWNER=$OWNER_OVERRIDE
+    NC_OWNER_HOME=""
+    NC_OWNER_UID=""
+  fi
+  [[ -n "$NC_OWNER" ]] || NC_OWNER=${SUDO_USER:-}
+  [[ -n "$NC_OWNER" ]] || die \
+    'checked who owns the cloud-nas pipeline' \
+    "no NC_OWNER in $STATE_CONF and SUDO_USER is empty" \
+    'a username, so the user systemd manager and rclone can be queried as that user' \
+    'run this as your normal user and let it re-exec through sudo, or pass --owner <user>'
+
+  [[ -n "$NC_OWNER_HOME" ]] || NC_OWNER_HOME=$(getent passwd "$NC_OWNER" 2>/dev/null | cut -d: -f6 || true)
+  [[ -n "$NC_OWNER_UID" ]] || NC_OWNER_UID=$(getent passwd "$NC_OWNER" 2>/dev/null | cut -d: -f3 || true)
+
+  [[ "$NC_OWNER_UID" =~ ^[0-9]+$ ]] || die \
+    "resolved the numeric uid of the pipeline owner '$NC_OWNER'" \
+    "got '$NC_OWNER_UID'" \
+    'a numeric uid from getent passwd' \
+    "check that '$NC_OWNER' exists on this box, or pass --owner with the right username"
+  [[ -d "$NC_OWNER_HOME" ]] || die \
+    "checked the home directory of the pipeline owner '$NC_OWNER'" \
+    "'$NC_OWNER_HOME' is not a directory" \
+    "the owner's home, where the rclone and cloud-nas configuration lives" \
+    "check /etc/passwd for '$NC_OWNER', or pass --owner with the right username"
+}
+
+resolve_baseline() {
+  local d best=""
+  if [[ -n "$BASELINE_OVERRIDE" ]]; then
+    [[ -d "$BASELINE_OVERRIDE" ]] || die \
+      'checked the directory given with --baseline' \
+      "'$BASELINE_OVERRIDE' is not a directory" \
+      'a baseline directory written by nextcloud-preflight' \
+      "list what is there with: ls -1d $BASELINE_ROOT/baseline-*"
+    BASELINE=$BASELINE_OVERRIDE
+    return 0
+  fi
+
+  # Guarded rather than globbed into a command: an unmatched glob would expand
+  # to the literal pattern and the diff would run against nothing.
+  for d in "$BASELINE_ROOT"/baseline-*; do
+    [[ -d "$d" ]] || continue
+    if [[ -z "$best" || "$d" > "$best" ]]; then
+      best=$d
+    fi
+  done
+  [[ -n "$best" ]] || die \
+    "looked for a baseline directory under $BASELINE_ROOT" \
+    'no baseline-* directory exists' \
+    'the baseline nextcloud-preflight writes before anything is changed' \
+    'run nextcloud-preflight first; without a baseline there is nothing to diff against and this command will not guess what the box used to look like'
+  BASELINE=$best
+}
+
+report_header() {
+  local f count=0
+  section "Baseline"
+  note "baseline:  $BASELINE"
+  note "captured:  $(stat -c '%y' -- "$BASELINE" 2>/dev/null || printf unknown)"
+  note "host:      $(uname -n) $(uname -r)"
+  note "owner:     $NC_OWNER (uid $NC_OWNER_UID, home $NC_OWNER_HOME)"
+  if (( CONF_LOADED )); then
+    note "state:     $STATE_CONF (NC_ROOT=$NC_ROOT)"
+    if [[ -n "$BASELINE_DIR" && "$BASELINE_DIR" != "$BASELINE" ]]; then
+      soft "the installer recorded BASELINE_DIR=$BASELINE_DIR but this run is diffing $BASELINE; re-run with --baseline $BASELINE_DIR to compare against the state the install actually started from"
+    fi
+  else
+    note "state:     $STATE_CONF absent - nextcloud-install has not run; NC_ROOT reporting is skipped"
+  fi
+  note 'captures:'
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    printf '  %s\n' "${f#"$BASELINE"/}"
+    count=$((count + 1))
+  done < <(find "$BASELINE" -maxdepth 2 -type f 2>/dev/null | LC_ALL=C sort)
+  (( count > 0 )) || soft "the baseline directory $BASELINE holds no files; every check below will report that it could not be evaluated"
+}
+
+check_modules() {
+  local base mod m loaded=" " candidates=0 missing=()
+  section "Platform modules (hard)"
+  if ! base=$(baseline_file 'lsmod*' '*lsmod*' 'modules*'); then
+    fail 'looked in the baseline for the recorded lsmod output' \
+      "no lsmod capture found in $BASELINE" \
+      'the lsmod capture nextcloud-preflight writes' \
+      'point --baseline at the directory that has it; a module check with no baseline cannot be answered, and an unanswerable check is not a pass'
+    return 0
+  fi
+
+  note "compared against ${base#"$BASELINE"/}"
+
+  # /proc/modules rather than lsmod(8): identical first column, one fewer
+  # command to depend on while proving the platform driver is still loaded.
+  while read -r m _; do
+    [[ -n "$m" ]] || continue
+    loaded+="${m//-/_} "
+  done </proc/modules
+
+  while read -r mod _; do
+    [[ -n "$mod" ]] || continue
+    [[ "$mod" != Module ]] || continue
+    m=${mod//-/_}
+    case "$m" in
+      asustor*|leds_gpio|gpio_keys_polled) ;;
+      *) continue ;;
+    esac
+    candidates=$((candidates + 1))
+    case "$loaded" in
+      *" $m "*) note "ok: $m still loaded" ;;
+      *) missing+=("$m") ;;
+    esac
+  done <"$base"
+
+  # Said out loud rather than passing silently: a section that printed nothing
+  # would read as an all-clear when it actually had nothing to check.
+  (( candidates > 0 )) || soft "the baseline lsmod recorded no asustor, leds_gpio or gpio_keys_polled module, so nothing here can have been lost; fan and LED control were already unavailable before this project started"
+
+  if (( ${#missing[@]} > 0 )); then
+    fail 'compared the loaded asustor platform modules against the baseline lsmod' \
+      "recorded at baseline but not loaded now: ${missing[*]}" \
+      'every asustor, leds_gpio and gpio_keys_polled module the baseline recorded, still loaded' \
+      'fan, LED and hwmon control are gone on a box nobody can reach physically: check dmesg, modprobe them back, and check whether a kernel upgrade left hand-built (non-DKMS) modules behind'
+  fi
+}
+
+check_hwmon() {
+  local f n found=0 names=" " base bname=""
+  section "asustor_it87 hwmon (hard)"
+  if base=$(baseline_file 'hwmon*name*' '*hwmon*'); then
+    bname=$(first_line "$base")
+  fi
+  for f in /sys/devices/platform/asustor_it87.*/hwmon/hwmon*/name; do
+    [[ -r "$f" ]] || continue
+    found=1
+    n=$(cat "$f" 2>/dev/null || true)
+    names+="$n "
+    note "ok: ${f%/name} reports ${n:-unreadable}"
+  done
+  if (( ! found )); then
+    fail 'globbed /sys/devices/platform/asustor_it87.*/hwmon/hwmon*/name' \
+      "no match; the baseline recorded '${bname:-nothing}'" \
+      'at least one readable hwmon name under an asustor_it87 platform device' \
+      'the it87 hwmon is the fan and temperature interface: check that the asustor_it87 module is loaded, that acpi_enforce_resources=lax is on the kernel command line, and that stock it87 is still blacklisted'
+    return 0
+  fi
+  case "$names" in
+    *" it8625 "*) ;;
+    *)
+      soft "asustor_it87 hwmon is present but no chip reports it8625 (found:${names% }); matched on contents, never on the hwmon index, so this is a real chip-name change and not a renumbered directory"
+      ;;
+  esac
+}
+
+check_user_units() {
+  local base cur err filtered=1 name rc=0
+  local -a gone=() added=()
+  section "systemd user units (hard)"
+  # Owner-specific patterns first: a baseline that also captured the SYSTEM
+  # manager's unit files would otherwise sort ahead of the user one and this
+  # check would diff two different managers against each other.
+  if ! base=$(baseline_file 'user-unit-files*' '*user-unit-files*' '*user*unit-files*' \
+    '*user*unit_files*' '*list-unit-files*' '*unit-files*' '*unit_files*'); then
+    fail "looked in the baseline for the recorded systemd user unit files of $NC_OWNER" \
+      "no unit-file capture found in $BASELINE" \
+      'the run_user_systemctl list-unit-files capture nextcloud-preflight writes' \
+      'point --baseline at the directory that has it; the cloud-nas timers are the thing this whole project promised not to touch, so this check is never allowed to pass unevaluated'
+    return 0
+  fi
+
+  note "compared against ${base#"$BASELINE"/}"
+
+  # The baseline may have been captured filtered to cloud-nas* or unfiltered.
+  # Comparing the two shapes would report every unrelated user unit on the box
+  # as a change, so the current side is taken in whichever shape the baseline is.
+  while read -r name _; do
+    [[ -n "$name" ]] || continue
+    case "$name" in
+      cloud-nas*) ;;
+      *) filtered=0; break ;;
+    esac
+  done < <(norm_stream <"$base")
+
+  cur="$TMP/user-unit-files"
+  err="$TMP/user-unit-files.err"
+  if (( filtered )); then
+    run_user_systemctl list-unit-files 'cloud-nas*' >"$cur" 2>"$err" || rc=$?
+  else
+    run_user_systemctl list-unit-files >"$cur" 2>"$err" || rc=$?
+  fi
+  if (( rc != 0 )); then
+    fail "queried the systemd user manager of $NC_OWNER for its unit files" \
+      "systemctl --user exited $rc: $(first_line "$err" "no error output")" \
+      'the same unit list the baseline recorded' \
+      "if /run/user/$NC_OWNER_UID is gone the manager is not running at all, which means the cloud-nas timers are not running either: check 'loginctl show-user $NC_OWNER --property=Linger --value' and log the owner in. Never a bare 'systemctl --user' here - as root that answers for root and reports a false all-clear"
+    return 0
+  fi
+
+  mapfile -t gone < <(only_in_first "$base" "$cur")
+  mapfile -t added < <(only_in_second "$base" "$cur")
+
+  if (( ${#gone[@]} > 0 )); then
+    for name in "${gone[@]}"; do
+      printf '  - %s\n' "$name"
+    done
+  fi
+  if (( ${#added[@]} > 0 )); then
+    for name in "${added[@]}"; do
+      printf '  + %s\n' "$name"
+    done
+  fi
+
+  if (( ${#gone[@]} > 0 || ${#added[@]} > 0 )); then
+    fail "compared the systemd user unit files of $NC_OWNER against the baseline" \
+      "${#gone[@]} line(s) gone, ${#added[@]} line(s) new (listed above, - gone, + new)" \
+      'a byte-for-byte identical unit list; this project installs no user units and disables none' \
+      "restore the missing units from the owner's ~/.config/systemd/user and run 'systemctl --user daemon-reload' as $NC_OWNER; a state change (enabled -> disabled) shows here as one gone and one new line for the same unit"
+  else
+    note "ok: $(norm_stream <"$base" | LC_ALL=C sort -u | wc -l) unit-file line(s) unchanged$( (( filtered )) && printf ' (baseline was captured filtered to cloud-nas*)')"
+  fi
+}
+
+check_sshd() {
+  section "sshd (hard)"
+  if systemctl is-active --quiet sshd.service; then
+    note 'ok: sshd.service is active'
+  elif systemctl is-active --quiet sshd.socket; then
+    note 'ok: sshd.socket is active (socket-activated sshd)'
+  else
+    fail 'checked that sshd is still accepting logins' \
+      'neither sshd.service nor sshd.socket is active' \
+      'an active sshd' \
+      'this box is headless and reachable only over the tailnet, and ssh is the only way in: start it now with "systemctl start sshd" from whatever session you still have'
+  fi
+  if ! systemctl is-enabled --quiet sshd.service 2>/dev/null && ! systemctl is-enabled --quiet sshd.socket 2>/dev/null; then
+    soft 'sshd is not enabled at boot; the box is reachable now but a reboot would strand it'
+  fi
+}
+
+check_cmdline() {
+  local base bc cc token='acpi_enforce_resources=lax'
+  section "Kernel command line (hard)"
+  cc=$(</proc/cmdline)
+  cc=${cc//$'\n'/ }
+  if ! base=$(baseline_file 'proc-cmdline*' 'cmdline*' '*cmdline*'); then
+    fail 'looked in the baseline for the recorded /proc/cmdline' \
+      "no cmdline capture found in $BASELINE" \
+      'the /proc/cmdline capture nextcloud-preflight writes' \
+      "point --baseline at the directory that has it; the box currently boots with: $cc"
+    return 0
+  fi
+  note "compared against ${base#"$BASELINE"/}"
+  bc=$(<"$base")
+  bc=${bc//$'\n'/ }
+
+  if [[ " $bc " == *" $token "* ]]; then
+    if [[ " $cc " == *" $token "* ]]; then
+      note "ok: $token still on the kernel command line"
+    else
+      fail "compared /proc/cmdline against the baseline for $token" \
+        "the baseline had it, the running kernel does not: $cc" \
+        'the same kernel command line the baseline recorded' \
+        'the driver README lists this as required for full it87 functionality; a bootloader regeneration dropped it. Restore it in the bootloader entry and reboot only when someone can reach the box'
+    fi
+  else
+    soft "the baseline kernel command line did not carry $token either, so nothing was lost here; fan and LED control were already running without it before this project started"
+  fi
+  if [[ "$bc" != "$cc" ]]; then
+    soft 'the kernel command line differs from the baseline in other ways:'
+    printf '  baseline: %s\n' "$bc"
+    printf '  now:      %s\n' "$cc"
+  fi
+}
+
+check_rclone() {
+  local remote entries rc=0
+  section "Live rclone read as the owner (hard)"
+  if (( ! DO_RCLONE )); then
+    note 'skipped: --no-rclone was passed, so outbound HTTPS from the pipeline is NOT proven by this run'
+    return 0
+  fi
+
+  # A unit-status check only proves systemd still has the timers. Docker rewrites
+  # host NAT, and a broken outbound path shows up nowhere in unit state - so one
+  # real read is done here, as the owner, against the owner's own rclone config.
+  # Any token refresh it triggers lands in the owner's config exactly as it does
+  # on every scheduled sync, never in root's.
+  if ! owner_run rclone listremotes >"$TMP/remotes" 2>"$TMP/remotes.err"; then
+    soft "could not list rclone remotes as $NC_OWNER ($(first_line "$TMP/remotes.err" "no error output")); the outbound read was NOT performed and outbound HTTPS is unproven"
+    return 0
+  fi
+  remote=$(first_line "$TMP/remotes")
+  if [[ -z "$remote" ]]; then
+    soft "$NC_OWNER has no rclone remotes configured; the outbound read was NOT performed and outbound HTTPS is unproven"
+    return 0
+  fi
+  case "$remote" in
+    *:) ;;
+    *) remote="$remote:" ;;
+  esac
+
+  owner_run timeout 120 rclone lsd "$remote" --max-depth 1 --contimeout 20s --timeout 60s --retries 1 --low-level-retries 1 \
+    >"$TMP/lsd" 2>"$TMP/lsd.err" || rc=$?
+  if (( rc == 0 )); then
+    entries=$(wc -l <"$TMP/lsd")
+    note "ok: read $remote as $NC_OWNER, $entries top-level entries"
+    return 0
+  fi
+  fail "read $remote with rclone as $NC_OWNER to prove outbound HTTPS still works" \
+    "rclone exited $rc: $(first_line "$TMP/lsd.err" "no error output")" \
+    'a successful listing, the same as any scheduled cloud-nas sync performs' \
+    'run it again first - a cloud-side 5xx or an expired token looks identical here. If it keeps failing, suspect host NAT: Docker rewrites the nat table on start, so check "iptables -t nat -L -n", and compare the FORWARD policy line reported below against the baseline'
+}
+
+diff_mounts() {
+  local base cur line tgt src fst unexpected=0
+  local -a gone=() added=()
+  section "Mount table (warn)"
+  if ! base=$(baseline_file 'findmnt*' '*findmnt*' 'mounts*'); then
+    soft "no findmnt capture in $BASELINE; the mount table could not be compared"
+    return 0
+  fi
+  cur="$TMP/findmnt"
+  capture "$cur" findmnt -R -o TARGET,SOURCE,FSTYPE,OPTIONS
+  mapfile -t gone < <(only_in_first "$base" "$cur")
+  mapfile -t added < <(only_in_second "$base" "$cur")
+
+  if (( ${#gone[@]} > 0 )); then
+    for line in "${gone[@]}"; do
+      printf '  - %s\n' "$line"
+    done
+    soft "${#gone[@]} mount line(s) from the baseline are gone; nothing in this project unmounts anything, so read these carefully"
+  fi
+  # Only additions are triaged: Docker legitimately adds overlay, shm and nsfs
+  # mounts, but it removes none, so a disappearance is never expected noise.
+  if (( ${#added[@]} > 0 )); then
+    for line in "${added[@]}"; do
+      read -r tgt src fst _ <<<"$line"
+      if [[ "$fst" == overlay || "$fst" == nsfs || "$src" == shm || "$src" == overlay ]] \
+        || [[ "$tgt" == /var/lib/docker/* || "$tgt" == /var/lib/containerd/* \
+        || "$tgt" == /run/docker/* || "$tgt" == /run/containerd/* ]]; then
+        printf '  + %s   (container runtime, expected)\n' "$line"
+      else
+        printf '  + %s\n' "$line"
+        unexpected=$((unexpected + 1))
+      fi
+    done
+    (( unexpected == 0 )) || soft "$unexpected new mount line(s) are not container-runtime mounts"
+  fi
+  (( ${#gone[@]} > 0 || ${#added[@]} > 0 )) || note 'ok: mount table identical to the baseline'
+}
+
+forward_policy() {
+  local f=${1:-} line pol="" intable=0
+  [[ -r "$f" ]] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      '*filter') intable=1 ;;
+      '*'*) intable=0 ;;
+      ':FORWARD '*)
+        if (( intable )); then
+          pol=${line#:FORWARD }
+          pol=${pol%% *}
+        fi
+        ;;
+    esac
+  done <"$f"
+  [[ -n "$pol" ]] || return 1
+  printf '%s\n' "$pol"
+}
+
+diff_forwarding() {
+  local base cur key bval cval proc bpol cpol
+  section "IP forwarding and FORWARD policy (warn)"
+  if base=$(baseline_file 'sysctl*' '*sysctl*' '*ip_forward*'); then
+    while read -r key _ bval; do
+      case "$key" in
+        net.ipv4.ip_forward) proc=/proc/sys/net/ipv4/ip_forward ;;
+        net.ipv6.conf.all.forwarding) proc=/proc/sys/net/ipv6/conf/all/forwarding ;;
+        *) continue ;;
+      esac
+      if [[ -r "$proc" ]]; then
+        cval=$(<"$proc")
+      else
+        cval=absent
+      fi
+      if [[ "$cval" == "$bval" ]]; then
+        note "ok: $key = $cval (unchanged)"
+      else
+        soft "$key was $bval at baseline and is $cval now; Docker enables forwarding on first start, and if this node advertises subnet routes the installer pre-set it deliberately. Compared against the recorded value, never against an assumed default"
+      fi
+    done < <(norm_stream <"$base")
+  else
+    soft "no sysctl capture in $BASELINE; IP forwarding could not be compared"
+  fi
+
+  if ! command -v iptables-save >/dev/null 2>&1; then
+    note 'iptables-save is not installed; the FORWARD policy was not compared'
+    return 0
+  fi
+  cur="$TMP/iptables-filter"
+  capture "$cur" iptables-save -t filter
+  if ! base=$(baseline_file 'iptables-save' 'iptables-save.txt' 'iptables.txt' 'iptables'); then
+    soft "no iptables-save capture in $BASELINE; the FORWARD policy could not be compared"
+    return 0
+  fi
+  bpol=$(forward_policy "$base" || true)
+  cpol=$(forward_policy "$cur" || true)
+  if [[ -z "$bpol" || -z "$cpol" ]]; then
+    soft "could not read a filter/FORWARD policy from both sides (baseline '${bpol:-none}', now '${cpol:-none}')"
+    return 0
+  fi
+  if [[ "$bpol" == "$cpol" ]]; then
+    note "ok: filter FORWARD policy is $cpol (unchanged)"
+  else
+    soft "filter FORWARD policy was $bpol at baseline and is $cpol now; Docker sets it to DROP only when it was the one to enable forwarding, so this is reported against the recorded value and is not by itself a fault"
+  fi
+}
+
+diff_space() {
+  local base fs pcent mnt bpct cpct delta m free
+  section "Free space (warn)"
+  if (( CONF_LOADED )) && [[ -n "$NC_ROOT" ]]; then
+    m=$(mnt_of "$NC_ROOT" || true)
+    free=$(free_bytes "$NC_ROOT" || true)
+    cpct=$(used_pct "$NC_ROOT" || true)
+    note "NC_ROOT   $NC_ROOT on ${m:-unknown} ($(fstype_of "$NC_ROOT" || printf unknown)): $(hbytes "$free") free, ${cpct:-unknown}% used"
+  fi
+  m=$(mnt_of /var/lib || true)
+  free=$(free_bytes /var/lib || true)
+  cpct=$(used_pct /var/lib || true)
+  note "/var/lib  on ${m:-unknown}: $(hbytes "$free") free, ${cpct:-unknown}% used (images land in /var/lib/docker and /var/lib/containerd)"
+
+  if ! base=$(baseline_file 'df-h*' 'df*' '*df-h*'); then
+    soft "no df capture in $BASELINE; free-space deltas could not be computed"
+    return 0
+  fi
+  while read -r fs _ _ _ pcent mnt; do
+    [[ -n "$mnt" ]] || continue
+    [[ "$fs" != Filesystem ]] || continue
+    # Pseudo filesystems are dropped rather than reported: /run/credentials/*
+    # and /run/user/* appear and vanish with services and logins, and a
+    # free-space report that cries wolf about them gets ignored wholesale. The
+    # user manager is proven by the unit-file check, not by this one.
+    case "$fs" in
+      tmpfs|devtmpfs|efivarfs|udev|none|overlay|squashfs) continue ;;
+    esac
+    case "$mnt" in
+      /run|/run/*|/dev|/dev/*|/sys|/sys/*|/proc|/proc/*) continue ;;
+    esac
+    bpct=${pcent%\%}
+    [[ "$bpct" =~ ^[0-9]+$ ]] || continue
+    m=$(mnt_of "$mnt" || true)
+    if [[ "$m" != "$mnt" ]]; then
+      soft "the baseline filesystem mounted at $mnt is no longer mounted there (that path now resolves to ${m:-nothing})"
+      continue
+    fi
+    cpct=$(used_pct "$mnt" || true)
+    [[ "$cpct" =~ ^[0-9]+$ ]] || continue
+    delta=$((cpct - bpct))
+    printf '  %-28s %3s%% -> %3s%%  (%+d)\n' "$mnt" "$bpct" "$cpct" "$delta"
+    if (( delta >= GROW_WARN_PCT )); then
+      soft "$mnt grew ${delta} points since the baseline (${bpct}% -> ${cpct}%)"
+    fi
+    if (( cpct >= FULL_WARN_PCT )); then
+      soft "$mnt is ${cpct}% used; the cloud mirror needs room to grow and a full array breaks the backup pipeline this box exists for"
+    fi
+  done < <(norm_stream <"$base")
+}
+
+diff_swap() {
+  local base cur line
+  local -a lines=()
+  section "Swap (warn)"
+  cur="$TMP/swapon"
+  capture "$cur" swapon --show --noheadings
+  if [[ -s "$cur" ]]; then
+    while IFS= read -r line; do
+      printf '  %s\n' "$line"
+    done <"$cur"
+    return 0
+  fi
+  if base=$(baseline_file 'swapon*' '*swap*'); then
+    mapfile -t lines < <(norm_stream <"$base")
+    if (( ${#lines[@]} > 0 )); then
+      soft "the baseline recorded swap or zram and there is none now; on 4 GB an OOM event can select tailscaled, and a headless tailnet-only NAS that loses tailscaled needs physical access"
+      return 0
+    fi
+  fi
+  soft 'no swap or zram is active; on 4 GB an OOM event can select tailscaled or the running rclone sync'
+}
+
+diff_leds() {
+  local base tok name present=" " absent="" recorded=0
+  section "LEDs (warn)"
+  for name in /sys/class/leds/*; do
+    [[ -e "$name" ]] || continue
+    name=${name##*/}
+    is_asustor_led "$name" || continue
+    present+="$name "
+  done
+  if ! base=$(baseline_file 'sys-class-leds*' 'leds*' '*class-leds*'); then
+    soft "no /sys/class/leds capture in $BASELINE; the LED set could not be compared"
+    note "currently present:${present% }"
+    return 0
+  fi
+  # Token scan rather than line parsing: the capture may be ls -1 or ls -l, and
+  # the ASUSTOR LED names are distinctive enough to be recognised either way.
+  while IFS= read -r tok; do
+    [[ -n "$tok" ]] || continue
+    tok=${tok##*/}
+    is_asustor_led "$tok" || continue
+    recorded=$((recorded + 1))
+    case "$present" in
+      *" $tok "*) ;;
+      *)
+        case " $absent " in
+          *" $tok "*) ;;
+          *) absent+="$tok " ;;
+        esac
+        ;;
+    esac
+  done < <(tr -s '[:space:]' '\n' <"$base")
+
+  if [[ -n "$absent" ]]; then
+    soft "LEDs recorded at baseline and absent now: ${absent% }"
+  elif (( recorded == 0 )); then
+    soft 'the baseline recorded no ASUSTOR LEDs, so nothing here can have been lost; LED control was already unavailable before this project started'
+  else
+    note "ok: every ASUSTOR LED recorded at baseline is still present (${present# })"
+  fi
+}
+
+diff_kernel() {
+  local base bver cver
+  section "Kernel and packages (warn)"
+  cver=$(uname -r)
+  if base=$(baseline_file 'uname-r*' 'uname*'); then
+    bver=$(first_line "$base")
+    if [[ "$bver" == "$cver" ]]; then
+      note "ok: running kernel $cver, unchanged"
+    else
+      soft "the running kernel is $cver and the baseline recorded $bver; if the asustor modules were hand-built rather than DKMS-managed they were built for $bver"
+    fi
+  else
+    note "no uname capture in $BASELINE; running kernel is $cver"
+  fi
+
+  command -v pacman >/dev/null 2>&1 || return 0
+  base=$(baseline_file 'pacman-Qq*' 'pacman-qq*' 'packages*') || return 0
+  local cur="$TMP/pacman-Qq"
+  local -a gone=() added=()
+  capture "$cur" pacman -Qq
+  [[ -s "$cur" ]] || return 0
+  mapfile -t gone < <(comm -23 \
+    <(LC_ALL=C awk '{ print $1 }' <"$base" | LC_ALL=C sort -u) \
+    <(LC_ALL=C awk '{ print $1 }' <"$cur" | LC_ALL=C sort -u))
+  mapfile -t added < <(comm -13 \
+    <(LC_ALL=C awk '{ print $1 }' <"$base" | LC_ALL=C sort -u) \
+    <(LC_ALL=C awk '{ print $1 }' <"$cur" | LC_ALL=C sort -u))
+  if (( ${#gone[@]} > 0 )); then
+    soft "${#gone[@]} package(s) present at baseline are gone: ${gone[*]}"
+  fi
+  if (( ${#added[@]} > 0 )); then
+    note "${#added[@]} package(s) added since the baseline: ${added[*]}"
+  fi
+  (( ${#gone[@]} > 0 || ${#added[@]} > 0 )) || note 'ok: installed package set unchanged'
+}
+
+report_services() {
+  local unit enabled active
+  section "Services (report)"
+  for unit in tailscaled.service sshd.service sshd.socket docker.service docker.socket containerd.service; do
+    enabled=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+    active=$(systemctl is-active "$unit" 2>/dev/null || true)
+    printf '  %-22s enabled=%-12s active=%s\n' "$unit" "${enabled:-unknown}" "${active:-unknown}"
+  done
+  systemctl is-active --quiet tailscaled.service \
+    || soft 'tailscaled is not active; this box is reachable only over the tailnet'
+  systemctl is-enabled --quiet tailscaled.service 2>/dev/null \
+    || soft 'tailscaled is not enabled at boot; after a reboot a healthy box would be indistinguishable from a dead one and would need physical access'
+  if (( CONF_LOADED )); then
+    systemctl is-enabled --quiet docker.service 2>/dev/null \
+      || soft 'docker.service is not enabled at boot; with only docker.socket enabled, dockerd starts on the next client call rather than at boot and "restart: unless-stopped" containers do not come back after an unattended reboot'
+  fi
+
+  section "cloud-nas timers (report)"
+  run_user_systemctl list-timers --all 'cloud-nas*' 2>/dev/null || soft "could not list the cloud-nas timers of $NC_OWNER"
+}
+
+main() {
+  parse_args "$@"
+  resolve_owner
+  resolve_baseline
+
+  TMP=$(mktemp -d 2>/dev/null) || die \
+    'created a private working directory for the current-state captures' \
+    'mktemp -d failed' \
+    'a writable TMPDIR' \
+    'free space on /tmp or fix its permissions; this command writes nothing anywhere else'
+  trap 'rm -rf -- "${TMP:?}"' EXIT
+
+  report_header
+  check_modules
+  check_hwmon
+  check_user_units
+  check_sshd
+  check_cmdline
+  check_rclone
+  diff_mounts
+  diff_forwarding
+  diff_space
+  diff_swap
+  diff_leds
+  diff_kernel
+  report_services
+
+  section "Result"
+  if (( FAILURES > 0 )); then
+    printf 'POSTFLIGHT FAILED - %d hard failure(s), %d warning(s) - baseline: %s\n' \
+      "$FAILURES" "$WARNINGS" "$BASELINE"
+    exit 1
+  fi
+  printf 'POSTFLIGHT PASSED - nothing that was promised to stay untouched has moved - %d warning(s) - baseline: %s\n' \
+    "$WARNINGS" "$BASELINE"
+}
+
+main "$@"

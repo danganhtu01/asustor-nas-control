@@ -1,0 +1,1816 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROGRAM=${0##*/}
+
+STATE_DIR=/var/lib/nextcloud-trial
+EXPECTED_TSIP=100.113.121.58
+EXPECTED_HOSTNAME=archnas
+NC_IMAGE=nextcloud:34.0.2-apache
+DB_IMAGE=postgres:18-alpine
+REDIS_IMAGE=redis:8-alpine
+
+DEFAULT_PORT=8080
+DEFAULT_PROJECT=nextcloud-trial
+SUBNET_CANDIDATES=(172.31.240.0/24 172.31.241.0/24 10.201.7.0/24)
+DOCKER_DEFAULT_BRIDGE=172.17.0.0/16
+DOCKER_MODULES=(overlay br_netfilter veth ip_tables nf_conntrack ip_set xt_set)
+GUARD_KEYS=(NAS02_MOUNT NAS03_MOUNT NAS03_TARGET NAS02_BACKUP_ROOT CLOUD_NAS_STATE_DIR)
+CONTAINMENT_SUBJECTS=(/var/lib/docker /var/lib/containerd)
+
+MIN_VARLIB_BYTES=$(( 15 * 1024 * 1024 * 1024 ))
+MIN_ROOT_BYTES=$(( 20 * 1024 * 1024 * 1024 ))
+MAX_ROOT_PCT=85
+MIN_MEMTOTAL_KB=$(( 6 * 1024 * 1024 ))
+MIN_MEMAVAIL_KB=1258291
+# The first 'up' rsyncs the whole Nextcloud tree into a volume on a 4-core
+# N5105, so a timer that fires inside half an hour still lands on top of it.
+INSTALL_WINDOW_SECS=1800
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  nextcloud-preflight --root <absolute path on the array> [options]
+
+Read-only discovery and refusal for the nextcloud-trial stack. It changes
+nothing outside /var/lib/nextcloud-trial/ and is safe to run blind.
+
+Required:
+  --root <path>            absolute path on the array for the Nextcloud tree
+
+Answers (flags, never environment variables - sudo's env_reset drops those):
+  --port <1-65535>         host port to publish on 127.0.0.1 (default: 8080)
+  --project <name>         compose project name (default: nextcloud-trial)
+  --subnet <CIDR>          pin the bridge subnet instead of picking a candidate
+  --fqdn <name>            tailnet FQDN, instead of deriving and confirming it
+  --tz <zone>              container timezone, e.g. Asia/Ho_Chi_Minh
+  --admin-user <name>      Nextcloud admin account name
+  --conf <path>            cloud-nas.conf to read (default: the owner's)
+  --guard <path>           extra path to test containment against; repeatable
+  --subnet-router[=y|n]    this node advertises subnet routes or is an exit node
+  --no-subnet-router       it does not
+
+Acknowledgements:
+  --allow-rootfs           accept an NC_ROOT that lands on the OS filesystem
+  --accept-low-ram         accept MemTotal under 6 GiB
+  --accept-ct-log          accept that the machine name becomes public forever
+  --setup-zram             the installer will create zram, so accept no swap yet
+
+Opt-in package path (checked here, performed by nextcloud-install):
+  --install-docker         also run the pacman preconditions
+  --i-understand-kernel-risk  override the asustor DKMS refusal
+
+  -h, --help               show this help
+
+Exit status:
+  0  every check passed; the last line names the baseline directory
+  1  the first refusal, printed as check / found / expected / fix
+USAGE
+}
+
+# Answered before the sudo re-exec so --help never asks for a password.
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help|help) usage; exit 0 ;;
+  esac
+done
+
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  exec sudo -- "$0" "$@"
+fi
+
+if [[ ! -r /usr/local/bin/nextcloud-lib ]]; then
+  printf 'error: checked for the helper library at /usr/local/bin/nextcloud-lib\n' >&2
+  printf '  found:    no readable file at that path\n' >&2
+  printf '  expected: the library installed beside the other nextcloud-* commands\n' >&2
+  printf '  fix:      re-run ./scripts/install.sh from the repo checkout\n' >&2
+  exit 1
+fi
+
+# shellcheck source=/dev/null
+source /usr/local/bin/nextcloud-lib
+
+opt_root=
+opt_port=$DEFAULT_PORT
+opt_project=$DEFAULT_PROJECT
+opt_subnet=
+opt_fqdn=
+opt_tz=
+opt_admin_user=
+opt_conf=
+opt_subnet_router=unanswered
+opt_allow_rootfs=0
+opt_accept_low_ram=0
+opt_accept_ct_log=0
+opt_setup_zram=0
+opt_install_docker=0
+opt_kernel_risk=0
+opt_guards=()
+
+while [[ $# -gt 0 ]]; do
+  arg=$1
+  val=
+  has_val=0
+  case "$arg" in
+    --*=*)
+      val=${arg#*=}
+      arg=${arg%%=*}
+      has_val=1
+      ;;
+  esac
+
+  case "$arg" in
+    --root|--port|--project|--subnet|--fqdn|--tz|--admin-user|--conf|--guard)
+      if (( has_val == 0 )); then
+        [[ $# -ge 2 ]] || die \
+          'checked that a value-taking option was given its value' \
+          "'$arg' was the last word on the command line" \
+          "$arg <value>, or ${arg}=<value>" \
+          "run '$PROGRAM --help'"
+        val=$2
+        shift
+      fi
+      case "$arg" in
+        --root)       opt_root=$val ;;
+        --port)       opt_port=$val ;;
+        --project)    opt_project=$val ;;
+        --subnet)     opt_subnet=$val ;;
+        --fqdn)       opt_fqdn=$val ;;
+        --tz)         opt_tz=$val ;;
+        --admin-user) opt_admin_user=$val ;;
+        --conf)       opt_conf=$val ;;
+        --guard)      opt_guards+=("$val") ;;
+      esac
+      ;;
+    --subnet-router)
+      if (( has_val == 1 )); then
+        case "$val" in
+          y|yes|true|1)  opt_subnet_router=yes ;;
+          n|no|false|0)  opt_subnet_router=no ;;
+          *) die \
+            'checked the value given to --subnet-router' \
+            "--subnet-router=$val" \
+            'yes or no' \
+            'pass --subnet-router (yes) or --no-subnet-router' ;;
+        esac
+      else
+        opt_subnet_router=yes
+      fi
+      ;;
+    --no-subnet-router)         opt_subnet_router=no ;;
+    --allow-rootfs)             opt_allow_rootfs=1 ;;
+    --accept-low-ram)           opt_accept_low_ram=1 ;;
+    --accept-ct-log)            opt_accept_ct_log=1 ;;
+    --setup-zram)               opt_setup_zram=1 ;;
+    --install-docker)           opt_install_docker=1 ;;
+    --i-understand-kernel-risk) opt_kernel_risk=1 ;;
+    *)
+      die \
+        'checked the command line for recognised options only' \
+        "unknown argument '$1'" \
+        'the flags listed by --help' \
+        "run '$PROGRAM --help'; every operator answer is a flag, because sudo's env_reset drops environment variables and -E can be refused by sudoers policy"
+      ;;
+  esac
+  shift
+done
+
+section() {
+  printf '\n== %s ==\n' "$1"
+}
+
+human_bytes() {
+  local b=${1:-0}
+  if (( b >= 1099511627776 )); then
+    printf '%d.%01d TiB\n' $(( b / 1099511627776 )) $(( b % 1099511627776 * 10 / 1099511627776 ))
+  elif (( b >= 1073741824 )); then
+    printf '%d.%01d GiB\n' $(( b / 1073741824 )) $(( b % 1073741824 * 10 / 1073741824 ))
+  elif (( b >= 1048576 )); then
+    printf '%d MiB\n' $(( b / 1048576 ))
+  else
+    printf '%d B\n' "$b"
+  fi
+}
+
+have() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+confirm() {
+  local prompt=$1 reply
+  [[ -t 0 ]] || return 1
+  read -r -p "$prompt [y/N] " reply || return 1
+  case "$reply" in
+    y|Y|yes|YES) return 0 ;;
+  esac
+  return 1
+}
+
+NC_TMP=
+cleanup() {
+  [[ -n "${NC_TMP:-}" ]] || return 0
+  rm -rf -- "${NC_TMP:?}" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# --- discovery state, filled in as the checks run --------------------------
+
+NC_OWNER=
+NC_OWNER_UID=
+NC_OWNER_HOME=
+NC_CONF=
+NC_FQDN=
+NC_FQDN_SOURCE=
+NC_ROOT_MNT=
+NC_ROOT_FSTYPE=
+NC_ROOT_SRC=
+NC_SUBNET=
+RAM_PROFILE=
+MEMTOTAL_KB=0
+BASELINE_DIR=
+TS_STATUS_JSON=
+TS_SERVE_JSON=
+DOCKER_PRESENT=0
+DOCKER_OK=0
+IMAGES_VERIFIED=0
+CRON_ENTRYPOINT=unverified
+IMAGE_WWW_UID=unverified
+IMAGE_WWW_GID=unverified
+GUARDS=()
+
+# cnc_get exits 1 both when a key is absent and when it refuses an unsafe
+# value, and its 'exit' happens inside the command substitution, where it
+# cannot stop this script. The two cases are told apart by whether it wrote its
+# refusal to stderr, and the refusal is re-raised here in the parent shell -
+# swallowing it would leave the containment guard silently unarmed.
+CNC_VALUE=
+cnc_lookup() {
+  local key=$1 rc=0 err="$NC_TMP/cnc_get.err"
+  CNC_VALUE=
+  : >"$err"
+  CNC_VALUE=$(cnc_get "$NC_CONF" "$key" "$NC_OWNER_HOME" 2>"$err") || rc=$?
+  if (( rc != 0 )); then
+    if [[ -s "$err" ]]; then
+      cat -- "$err" >&2
+      exit 1
+    fi
+    return 1
+  fi
+  return 0
+}
+
+ip4_to_int() {
+  local a b c d
+  IFS=. read -r a b c d <<<"$1"
+  printf '%s\n' $(( (10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d ))
+}
+
+is_cidr() {
+  [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]]
+}
+
+cidr_overlaps() {
+  local a=${1%%/*} alen=${1##*/} b=${2%%/*} blen=${2##*/}
+  local ai bi mlen mask
+  ai=$(ip4_to_int "$a")
+  bi=$(ip4_to_int "$b")
+  mlen=$alen
+  (( blen < mlen )) && mlen=$blen
+  if (( mlen == 0 )); then
+    return 0
+  fi
+  mask=$(( (0xFFFFFFFF << (32 - mlen)) & 0xFFFFFFFF ))
+  if (( (ai & mask) == (bi & mask) )); then
+    return 0
+  fi
+  return 1
+}
+
+# Nested and array fields are read with jq when it is present and with awk when
+# it is not. The awk fallbacks are line-oriented because tailscale pretty-prints
+# its JSON, so a single-line grep would miss a multi-line array entirely.
+json_array() {
+  local file=$1 key=$2
+  awk -v key="\"$key\"" '
+    index($0, key) && index($0, ":") && collecting == 0 {
+      if (index($0, "null")) { exit }
+      collecting = 1
+    }
+    collecting {
+      buf = buf $0
+      if (index($0, "]")) {
+        sub(/^[^[]*\[/, "", buf)
+        sub(/\][^]]*$/, "", buf)
+        n = split(buf, parts, ",")
+        for (i = 1; i <= n; i++) {
+          gsub(/[[:space:]"]/, "", parts[i])
+          if (parts[i] != "") print parts[i]
+        }
+        exit
+      }
+    }
+  ' "$file"
+}
+
+json_first_string() {
+  local file=$1 key=$2
+  awk -v key="\"$key\"" '
+    index($0, key) {
+      line = $0
+      sub(/^.*:[[:space:]]*"/, "", line)
+      sub(/".*$/, "", line)
+      print line
+      exit
+    }
+  ' "$file"
+}
+
+# --- 1. IDENTITY / OWNER ---------------------------------------------------
+
+check_identity() {
+  section 'IDENTITY / OWNER'
+
+  [[ -n "${SUDO_USER:-}" ]] || die \
+    'checked SUDO_USER after the sudo re-exec' \
+    'SUDO_USER is empty' \
+    "the invoking user's name" \
+    'Invoked directly as root; SUDO_USER is empty, so the owner home, the cloud-nas config and the user systemd bus cannot be located. Run this as your normal user - the script re-execs itself through sudo.'
+
+  [[ "$SUDO_USER" != root ]] || die \
+    'checked that SUDO_USER names the owner rather than root' \
+    'SUDO_USER=root' \
+    'the normal login account that owns the rclone pipeline' \
+    'You are already root; the user systemd bus and cloud-nas.conf this script must read belong to your normal account. Log in as that account and let the script sudo itself.'
+
+  NC_OWNER=$SUDO_USER
+  NC_OWNER_HOME=$(getent passwd "$NC_OWNER" 2>/dev/null | cut -d: -f6 || true)
+  NC_OWNER_UID=$(getent passwd "$NC_OWNER" 2>/dev/null | cut -d: -f3 || true)
+
+  [[ -n "$NC_OWNER_HOME" && -d "$NC_OWNER_HOME" ]] || die \
+    "checked the home directory of the invoking user '$NC_OWNER'" \
+    "Owner home '${NC_OWNER_HOME:-not in passwd}' does not exist" \
+    'an existing home directory holding .config/cloud-nas and .local/bin' \
+    'correct the passwd entry, or run this as the account that actually owns the cloud-nas pipeline'
+
+  [[ "$NC_OWNER_UID" =~ ^[0-9]+$ ]] || die \
+    "checked the numeric uid of '$NC_OWNER'" \
+    "uid '${NC_OWNER_UID:-unreadable}'" \
+    'an integer, needed to address the owner systemd user manager' \
+    'check that getent passwd answers for this account'
+
+  if [[ -z "$opt_conf" ]]; then
+    opt_conf="$NC_OWNER_HOME/.config/cloud-nas/cloud-nas.conf"
+  fi
+  NC_CONF=$opt_conf
+
+  note "owner:      $NC_OWNER (uid $NC_OWNER_UID)"
+  note "home:       $NC_OWNER_HOME"
+  note "cloud-nas:  $NC_CONF"
+}
+
+# --- 2. PLATFORM -----------------------------------------------------------
+
+check_platform() {
+  section 'PLATFORM'
+  local machine os_id
+
+  machine=$(uname -m)
+  os_id=$(grep -E '^ID=' /etc/os-release 2>/dev/null || true)
+
+  if [[ "$machine" != x86_64 ]] || ! grep -q '^ID=arch' /etc/os-release 2>/dev/null || ! have pacman; then
+    die \
+      'checked the architecture, the os-release ID and that pacman is present' \
+      "arch '$machine', ${os_id:-no ID= line in /etc/os-release}, pacman $(command -v pacman 2>/dev/null || printf 'not found')" \
+      'x86_64, ID=arch, and pacman on PATH' \
+      'This installer is for x86_64 Arch Linux (ArchNAS). You are not on the box you think you are.'
+  fi
+
+  note "platform:   $machine, ${os_id}, kernel $(uname -r)"
+}
+
+# --- 3. HOSTNAME SANITY (warn) ---------------------------------------------
+
+check_hostname() {
+  section 'HOSTNAME SANITY'
+  local static
+
+  static=$(hostnamectl --static 2>/dev/null || true)
+  if [[ "$static" == "$EXPECTED_HOSTNAME" ]]; then
+    note "hostname:   $static"
+  else
+    warn "Static hostname is ${static:-unreadable}, expected $EXPECTED_HOSTNAME. Continuing, but confirm this is the right machine."
+  fi
+}
+
+# --- 4. TAILNET IDENTITY ---------------------------------------------------
+
+check_tailnet_identity() {
+  section 'TAILNET IDENTITY'
+  local ip enabled
+
+  have tailscale || die \
+    'checked for the tailscale command' \
+    'tailscale is not on PATH' \
+    'the tailscale CLI, which every identity and TLS check below depends on' \
+    'install tailscale, or run this on the node that actually carries the tailnet address'
+
+  ip=$(tailscale ip -4 2>/dev/null | awk 'NR == 1' || true)
+  [[ "$ip" == "$EXPECTED_TSIP" ]] || die \
+    'checked the tailnet IPv4 address of this node' \
+    "tailscale ip -4 returned ${ip:-nothing}" \
+    "$EXPECTED_TSIP" \
+    'This is not ArchNAS. Aborting before anything is touched.'
+
+  systemctl is-active --quiet tailscaled || die \
+    'checked that tailscaled is active' \
+    "systemctl is-active tailscaled says $(systemctl is-active tailscaled 2>/dev/null || printf unknown)" \
+    'active' \
+    'tailscaled is not active. This box is reachable only over the tailnet; refusing to touch networking while it is down.'
+
+  enabled=$(systemctl is-enabled tailscaled 2>/dev/null || true)
+  [[ "$enabled" == enabled ]] || die \
+    'checked that tailscaled is enabled at boot' \
+    "systemctl is-enabled tailscaled says ${enabled:-unknown}" \
+    'enabled' \
+    'tailscaled is not enabled at boot. A headless tailnet-only NAS that reboots without tailscaled needs physical access. Enable it before continuing.'
+
+  note "tailnet ip: $ip (tailscaled active and enabled)"
+}
+
+# --- 5. TAILSCALE BACKEND STATE --------------------------------------------
+
+check_tailscale_backend() {
+  section 'TAILSCALE BACKEND STATE'
+  local state
+
+  TS_STATUS_JSON="$NC_TMP/tailscale-status.json"
+  tailscale status --json >"$TS_STATUS_JSON" 2>/dev/null || true
+  [[ -s "$TS_STATUS_JSON" ]] || die \
+    'checked that tailscale status --json produced output' \
+    'the command printed nothing' \
+    'the JSON status document, which carries BackendState and CertDomains' \
+    'run: tailscale status --json - and resolve whatever it reports before continuing'
+
+  if have jq; then
+    state=$(jq -r '.BackendState // empty' "$TS_STATUS_JSON" 2>/dev/null || true)
+  else
+    state=$(json_first_string "$TS_STATUS_JSON" BackendState)
+  fi
+
+  [[ "$state" == Running ]] || die \
+    'checked .BackendState in tailscale status --json' \
+    "BackendState is ${state:-unreadable}" \
+    'Running' \
+    'Do NOT run tailscale up from this script - it can change tailnet settings the researcher cannot see. Bring the backend up by hand, then re-run.'
+
+  note "backend:    $state"
+
+  if have jq; then
+    local health
+    health=$(jq -r '.Health[]? // empty' "$TS_STATUS_JSON" 2>/dev/null || true)
+    if [[ -n "$health" ]]; then
+      note 'health warnings reported by tailscaled (a degraded node produces confusing serve behaviour):'
+      printf '  %s\n' "$health"
+    else
+      note 'health:     no warnings'
+    fi
+  else
+    warn "jq is not installed, so .Health was not parsed. A degraded node produces confusing serve behaviour; read 'tailscale status' by eye."
+  fi
+}
+
+# --- 6. TAILNET HTTPS CERTIFICATES -----------------------------------------
+
+CERT_DOMAIN_FIRST=
+CERT_DOMAINS_VERIFIED=0
+
+check_cert_domains() {
+  section 'TAILNET HTTPS CERTIFICATES'
+  local domains=''
+
+  if have jq; then
+    CERT_DOMAINS_VERIFIED=1
+    domains=$(jq -r '.CertDomains[]? // empty' "$TS_STATUS_JSON" 2>/dev/null || true)
+  else
+    domains=$(json_array "$TS_STATUS_JSON" CertDomains || true)
+    if [[ -n "$domains" ]]; then
+      CERT_DOMAINS_VERIFIED=1
+    fi
+  fi
+
+  if (( CERT_DOMAINS_VERIFIED == 1 )) && [[ -z "$domains" ]]; then
+    die \
+      'checked .CertDomains in tailscale status --json' \
+      'CertDomains is empty' \
+      'at least one FQDN the control plane will provision a certificate for' \
+      'HTTPS certificates are not enabled for this tailnet. This cannot be fixed from the NAS. Go to https://login.tailscale.com/admin/dns, enable MagicDNS, then enable HTTPS Certificates. WARNING before you do: Tailscale documents that this publishes your machine name to the public Certificate Transparency ledger - "Do not enable the HTTPS feature if any of your machine names contain sensitive information." That is permanent and no teardown can undo it. Re-run with --accept-ct-log once you have read this.'
+  fi
+
+  if (( CERT_DOMAINS_VERIFIED == 0 )); then
+    warn 'jq is absent and .CertDomains could not be read from the JSON, so whether tailnet HTTPS certificates are enabled is UNVERIFIED. The FQDN below must then be supplied or confirmed by hand; if serve later drops into an interactive enable flow that hangs the installer, this is why.'
+    return 0
+  fi
+
+  CERT_DOMAIN_FIRST=$(printf '%s\n' "$domains" | awk 'NR == 1')
+  note 'cert domains:'
+  printf '  %s\n' "$domains"
+}
+
+# --- 7. FQDN DERIVATION ----------------------------------------------------
+
+check_fqdn() {
+  section 'FQDN DERIVATION'
+  local self_dns resolved
+
+  if have jq; then
+    self_dns=$(jq -r '.Self.DNSName // empty' "$TS_STATUS_JSON" 2>/dev/null || true)
+  else
+    # Self precedes Peer in the status document, so the first DNSName is ours.
+    self_dns=$(json_first_string "$TS_STATUS_JSON" DNSName)
+  fi
+  self_dns=${self_dns%.}
+
+  if [[ -n "$opt_fqdn" ]]; then
+    NC_FQDN=$opt_fqdn
+    NC_FQDN_SOURCE='--fqdn'
+  elif [[ -n "$CERT_DOMAIN_FIRST" ]]; then
+    NC_FQDN=$CERT_DOMAIN_FIRST
+    NC_FQDN_SOURCE='.CertDomains[0]'
+  elif [[ -n "$self_dns" ]]; then
+    NC_FQDN=$self_dns
+    NC_FQDN_SOURCE='.Self.DNSName'
+  elif [[ -t 0 ]]; then
+    read -r -p 'tailnet FQDN for this node (e.g. archnas.tailXXXX.ts.net): ' NC_FQDN || true
+    NC_FQDN_SOURCE='operator prompt'
+  fi
+
+  [[ -n "$NC_FQDN" ]] || die \
+    'checked .CertDomains, .Self.DNSName and the --fqdn flag for this node name' \
+    'none of them produced a name, and stdin is not a terminal to ask on' \
+    'a tailnet FQDN' \
+    'Could not derive or validate the tailnet FQDN. Never hardcode archnas.<tailnet>.ts.net - a wrong value produces an untrusted-domain lockout that then needs occ to unpick. Pass --fqdn <name>.'
+
+  note "fqdn:       $NC_FQDN  (from $NC_FQDN_SOURCE)"
+
+  if [[ -n "$self_dns" && -n "$CERT_DOMAIN_FIRST" && "$self_dns" != "$CERT_DOMAIN_FIRST" ]]; then
+    warn "cross-check: .Self.DNSName is $self_dns but .CertDomains[0] is $CERT_DOMAIN_FIRST. Confirm which one the browser will use."
+  fi
+
+  resolved=$(getent ahostsv4 "$NC_FQDN" 2>/dev/null | awk 'NR == 1 { print $1 }' || true)
+  if [[ "$resolved" == "$EXPECTED_TSIP" ]]; then
+    note "resolves:   $NC_FQDN -> $resolved"
+  elif [[ -n "$resolved" ]]; then
+    die \
+      "checked that $NC_FQDN resolves to this node" \
+      "getent ahostsv4 returned $resolved" \
+      "$EXPECTED_TSIP" \
+      'Could not derive or validate the tailnet FQDN. A name that resolves somewhere else produces an untrusted-domain lockout that then needs occ to unpick. Fix MagicDNS, or pass the correct --fqdn.'
+  elif [[ "$NC_FQDN_SOURCE" == '.CertDomains[0]' ]]; then
+    warn "$NC_FQDN does not resolve locally, but it came from .CertDomains, which is authoritative for certificate issuance. Confirm MagicDNS is on before the desktop client is pointed at it."
+  else
+    die \
+      "checked that $NC_FQDN resolves to this node" \
+      'getent ahostsv4 returned nothing' \
+      "$EXPECTED_TSIP" \
+      'Could not derive or validate the tailnet FQDN. Enable MagicDNS, or pass a --fqdn that resolves to this node.'
+  fi
+
+  if [[ "$NC_FQDN_SOURCE" != '--fqdn' ]]; then
+    if ! confirm "Use $NC_FQDN as the Nextcloud host name?"; then
+      die \
+        'asked for explicit confirmation of the derived FQDN' \
+        "the operator did not confirm $NC_FQDN, or stdin is not a terminal" \
+        'a confirmed host name before it is written anywhere' \
+        "re-run with --fqdn $NC_FQDN if that is right, or with the name you intend to use"
+    fi
+  fi
+}
+
+# --- 8. EXISTING TAILSCALE SERVE -------------------------------------------
+
+check_existing_serve() {
+  section 'EXISTING TAILSCALE SERVE'
+  local dump busy=0 trimmed
+
+  TS_SERVE_JSON="$NC_TMP/tailscale-serve-status.json"
+  tailscale serve status --json >"$TS_SERVE_JSON" 2>/dev/null || true
+  dump=$(cat -- "$TS_SERVE_JSON" 2>/dev/null || true)
+  trimmed=$(printf '%s' "$dump" | tr -d '[:space:]')
+
+  if [[ -z "$trimmed" || "$trimmed" == '{}' || "$trimmed" == null ]]; then
+    note 'serve:      no handlers configured'
+    return 0
+  fi
+
+  if have jq; then
+    if jq -e '((.TCP // {}) | has("443")) or ((.Web // {}) | keys[]? | endswith(":443"))' "$TS_SERVE_JSON" >/dev/null 2>&1; then
+      busy=1
+    fi
+  elif printf '%s' "$dump" | grep -q '443'; then
+    # Without jq the match is deliberately coarse: refusing to overwrite a
+    # handler that might exist is the safe direction of the two errors.
+    busy=1
+  fi
+
+  if (( busy == 1 )); then
+    die \
+      'checked tailscale serve status --json for an existing handler on :443' \
+      "$dump" \
+      'no serve handler on port 443' \
+      'Port 443 already has a serve handler. Refusing to overwrite a configuration this installer did not create. Remove it yourself, or choose a different node. NOTE: there is no verified node-scoped restore-from-file path - tailscale serve set-config is service-scoped - so if this installer clobbers your handler, re-issuing your original command is the only recovery.'
+  fi
+
+  note 'serve:      handlers exist, but none on :443'
+}
+
+# --- 9-13. THE --install-docker GATES --------------------------------------
+
+check_pacman_gates() {
+  section 'PACKAGE-PATH GATES (--install-docker)'
+
+  if (( opt_install_docker == 0 )); then
+    note 'skipped:    --install-docker was not requested, so pacman is not involved'
+    note '            nextcloud-install refuses when docker is absent and points here'
+    return 0
+  fi
+
+  local pkgver running lock owner_pkg modpath consent trans
+
+  # TMUX / SCREEN
+  [[ -n "${TMUX:-}${STY:-}" ]] || die \
+    'checked TMUX and STY before allowing a pacman transaction' \
+    'neither is set, so this is a bare SSH session' \
+    'a tmux or screen session' \
+    'pacman -Syu can restart tailscaled and kill the SSH session you are standing on, leaving a partial transaction and a stale /var/lib/pacman/db.lck on a headless box. Run inside tmux or screen.'
+
+  # PACMAN LOCK
+  lock=/var/lib/pacman/db.lck
+  [[ ! -e "$lock" ]] || die \
+    "checked for $lock" \
+    'the lock file exists' \
+    'no pacman lock' \
+    'pacman database is locked. Another transaction is running or a previous one died. Resolve it before continuing.'
+
+  # PENDING KERNEL
+  pkgver=$(pacman -Q linux 2>/dev/null | awk '{ print $2 }' || true)
+  running=$(uname -r)
+  if [[ -z "$pkgver" ]]; then
+    warn "the linux package is not installed, so the running kernel $running cannot be compared against a package version. If this box runs a custom or hand-built kernel, the module situation below is entirely yours to verify."
+  else
+    local norm_pkg norm_run
+    norm_pkg=$(printf '%s' "$pkgver" | tr '.-' '__')
+    norm_run=$(printf '%s' "$running" | tr '.-' '__')
+    [[ "$norm_pkg" == "$norm_run" ]] || die \
+      'compared pacman -Q linux against uname -r' \
+      "installed kernel $pkgver, running kernel $running" \
+      'the same kernel installed and running' \
+      'A reboot is ALREADY pending. Resolve the module situation before, not after.'
+  fi
+
+  # ASUSTOR MODULE DKMS STATE
+  local dkms_ok=0
+  if have dkms && dkms status 2>/dev/null | grep -q asustor; then
+    dkms_ok=1
+  else
+    modpath=$(modinfo -n asustor 2>/dev/null || true)
+    if [[ -n "$modpath" ]]; then
+      owner_pkg=$(pacman -Qo "$modpath" 2>/dev/null || true)
+      [[ -z "$owner_pkg" ]] || dkms_ok=1
+    fi
+  fi
+  if (( dkms_ok == 0 && opt_kernel_risk == 0 )); then
+    die \
+      'checked dkms status and pacman -Qo for the asustor platform modules' \
+      'neither DKMS nor any package owns them' \
+      'DKMS-managed modules that survive a kernel upgrade' \
+      "The asustor platform modules are hand-built and NOT DKMS-managed. pacman -Syu may pull a new kernel, and after the next reboot there will be no modules for it - fans, LEDs and the hwmon at /sys/devices/platform/asustor_it87.*/ all vanish on a box you cannot physically reach. Run 'sudo make dkms' in your asustor-platform-driver checkout FIRST, then re-run. Override only with --i-understand-kernel-risk."
+  fi
+  if (( dkms_ok == 0 )); then
+    warn '--i-understand-kernel-risk given: proceeding with hand-built asustor modules. After the next kernel upgrade and reboot, fan, LED and hwmon control may be gone on a box you cannot physically reach.'
+  fi
+
+  # PACMAN TRANSACTION REVIEW. -Syup refreshes /var/lib/pacman/sync, which is
+  # the only thing this command writes outside /var/lib/nextcloud-trial, and it
+  # happens only on this opt-in path.
+  warn 'pacman -Syup refreshes the pacman sync database. That is the only write this command makes outside /var/lib/nextcloud-trial, and only on the --install-docker path.'
+  trans=$(pacman -Syup --print-format '%n %v' 2>/dev/null | grep -vE '^(::|$)' || true)
+  if [[ -z "$trans" ]]; then
+    note 'transaction: pacman reports nothing to upgrade'
+  else
+    local count
+    count=$(printf '%s\n' "$trans" | awk 'END { print NR }')
+    note "the pending transaction includes $count packages:"
+    printf '  %s\n' "$trans"
+    consent=0
+    if confirm 'This can upgrade the kernel, systemd (triggering daemon-reexec), openssh and tailscale in one shot. Proceed?'; then
+      consent=1
+    fi
+    (( consent == 1 )) || die \
+      'printed the full pending pacman transaction and asked for consent' \
+      "$count packages would change, and consent was not given" \
+      'an explicit yes from an operator who has read the list' \
+      'Read it, then confirm. Do not gate only on the word linux appearing in the list.'
+  fi
+}
+
+# --- 14. PLATFORM DRIVER LOADED (warn) -------------------------------------
+
+check_platform_driver() {
+  section 'PLATFORM DRIVER'
+  local loaded count
+
+  loaded=$(lsmod | grep -E '^(asustor|asustor_it87|asustor_gpio_it87|leds_gpio|gpio_keys_polled) ' | awk '{ print $1 }' || true)
+  count=$(printf '%s' "$loaded" | grep -c . || true)
+
+  if [[ -n "$loaded" ]]; then
+    note 'asustor modules loaded:'
+    printf '  %s\n' "$loaded"
+  fi
+  if [[ "$count" != 5 ]]; then
+    warn "Expected 5 asustor platform modules, found ${count:-0}. Nextcloud does not need them, but their absence means fan and LED control is already broken before this project starts."
+  fi
+
+  if grep -q 'acpi_enforce_resources=lax' /proc/cmdline; then
+    note 'cmdline:    acpi_enforce_resources=lax present'
+  else
+    warn 'acpi_enforce_resources=lax is not on the kernel command line; the driver README lists it as required for full it87 functionality.'
+  fi
+}
+
+# --- 15. HWMON READABLE ----------------------------------------------------
+
+check_hwmon() {
+  section 'HWMON'
+  local f name found=0
+
+  for f in /sys/devices/platform/asustor_it87.*/hwmon/hwmon*/name; do
+    [[ -r "$f" ]] || continue
+    name=$(cat -- "$f" 2>/dev/null || true)
+    note "hwmon:      $f = ${name:-unreadable}"
+    # Matched on contents, never on the index: hwmon3 can become hwmon2 after
+    # any reboot.
+    if [[ "$name" == *it8625* ]]; then
+      found=1
+    fi
+  done
+
+  if (( found == 0 )); then
+    warn 'asustor_it87 hwmon not readable. Recorded for the postflight diff.'
+  fi
+}
+
+# --- 16. CGROUP v2 ---------------------------------------------------------
+
+check_cgroup() {
+  section 'CGROUP'
+  local fstype
+
+  fstype=$(stat -fc %T /sys/fs/cgroup 2>/dev/null || true)
+  if [[ "$fstype" == cgroup2fs ]]; then
+    note 'cgroup:     cgroup2fs'
+  else
+    warn "Box is on cgroup v1, deprecated by Docker 29. (stat -fc %T /sys/fs/cgroup says ${fstype:-unreadable})"
+  fi
+
+  grep -qw memory /sys/fs/cgroup/cgroup.controllers 2>/dev/null || die \
+    'checked /sys/fs/cgroup/cgroup.controllers for the memory controller' \
+    "controllers: $(cat /sys/fs/cgroup/cgroup.controllers 2>/dev/null || printf 'unreadable')" \
+    'the memory controller to be delegated' \
+    'The cgroup memory controller is not available. mem_limit will be accepted by Docker and silently NOT enforced, which removes the only mechanism keeping a Nextcloud spike from OOM-killing the rclone sync. This box runs a non-stock Arch install over ADM firmware, so a custom kernel config is plausible. Refusing.'
+
+  note 'memory controller available (mem_limit will be enforced)'
+}
+
+# --- 17. KERNEL MODULES DOCKER NEEDS ---------------------------------------
+
+check_docker_modules() {
+  section 'KERNEL MODULES DOCKER NEEDS'
+  local m
+
+  for m in "${DOCKER_MODULES[@]}"; do
+    if modprobe -n -v "$m" >/dev/null 2>&1; then
+      continue
+    fi
+    die \
+      "dry-run resolved each module Docker networking needs (${DOCKER_MODULES[*]})" \
+      "modprobe -n -v $m failed" \
+      "$m to be loadable or built in" \
+      "Kernel module $m is unavailable. Docker 28+/29 networking needs it. Discovering this when dockerd fails to start, after you have already disturbed the box over its only network path, is much worse than discovering it now. Check /usr/lib/modules/$(uname -r) matches the running kernel."
+  done
+
+  note "modules:    ${DOCKER_MODULES[*]} all resolvable"
+}
+
+# --- 18. NC_ROOT SUPPLIED --------------------------------------------------
+
+check_root_supplied() {
+  section 'NC_ROOT'
+  local candidates
+
+  if [[ -z "$opt_root" ]]; then
+    candidates=$(findmnt -n -o TARGET,FSTYPE,AVAIL --list 2>/dev/null | sort -k3 -h -r | awk 'NR <= 10' || true)
+    note 'the ten largest filesystems on this box:'
+    printf '  %s\n' "${candidates:-none reported}"
+    die \
+      'checked for --root' \
+      'no --root was given' \
+      'an absolute path on the array for the Nextcloud tree' \
+      'No --root given. Supply an absolute path on the array for the Nextcloud tree. There is no default and the script will not guess.'
+  fi
+
+  [[ "$opt_root" == /?* ]] || die \
+    'checked that --root is an absolute path below the root directory' \
+    "--root '$opt_root'" \
+    'an absolute path that is not /' \
+    'pass a path beginning with / that names a directory on the array'
+
+  note "nc_root:    $opt_root"
+}
+
+# --- 19-20. NC_ROOT MOUNT AND FILESYSTEM -----------------------------------
+
+check_root_mount() {
+  section 'NC_ROOT MOUNT'
+  local opts
+
+  if ! NC_ROOT_MNT=$(mnt_of "$opt_root"); then
+    die \
+      'asked findmnt which filesystem would hold NC_ROOT' \
+      "findmnt --target could not answer for $opt_root" \
+      'a mountpoint' \
+      'check that the path is resolvable and that the array is mounted'
+  fi
+  NC_ROOT_FSTYPE=$(fstype_of "$opt_root" || true)
+  NC_ROOT_SRC=$(src_of "$opt_root" || true)
+
+  note "mount:      $NC_ROOT_MNT (fstype ${NC_ROOT_FSTYPE:-unknown}, source ${NC_ROOT_SRC:-unknown})"
+
+  if [[ "$NC_ROOT_MNT" == / ]]; then
+    if (( opt_allow_rootfs == 0 )); then
+      die \
+        'checked that NC_ROOT lands on a real array mount rather than the OS filesystem' \
+        "NC_ROOT $opt_root resolves to mountpoint / (fstype=${NC_ROOT_FSTYPE:-unknown}, source=${NC_ROOT_SRC:-unknown})" \
+        'a mountpoint other than /' \
+        'Either the array is not mounted, or you have pointed at the OS disk - which will then fill and take the box down. Mount the array, or pass --allow-rootfs to override deliberately.'
+    fi
+    warn "--allow-rootfs given: NC_ROOT is on the OS filesystem (/). Nextcloud growth will now compete with the OS and with Docker's own storage."
+  fi
+
+  case "${NC_ROOT_FSTYPE:-}" in
+    vfat|exfat|ntfs|ntfs3|fuseblk|fuse|fuse.*)
+      die \
+        'checked the filesystem type under NC_ROOT' \
+        "NC_ROOT is on ${NC_ROOT_FSTYPE}" \
+        'a POSIX filesystem that is not FUSE-backed' \
+        'Either it has no POSIX ownership (chown/chmod are meaningless and Nextcloud will break), or it is a FUSE mount - and NAS_03 is fed by rclone, so a FUSE mount there would upload every Nextcloud file to Google Drive. Refusing absolutely.'
+      ;;
+  esac
+
+  opts=$(findmnt -n -o OPTIONS --target "$(nearest_existing "$opt_root")" 2>/dev/null || true)
+  opts=${opts%%$'\n'*}
+  case ",$opts," in
+    *,ro,*)
+      die \
+        'checked the mount options of the filesystem under NC_ROOT' \
+        "options: $opts" \
+        'a read-write mount' \
+        'NC_ROOT is on a read-only mount. Remount it read-write, or choose another path on the array.'
+      ;;
+  esac
+
+  note "options:    ${opts:-unreadable}"
+
+  case "${NC_ROOT_FSTYPE:-}" in
+    btrfs)
+      note '            btrfs: nextcloud-install creates NC_ROOT as a subvolume BEFORE writing anything inside it'
+      ;;
+    zfs)
+      note '            zfs: nextcloud-install requires an existing dataset whose mountpoint is NC_ROOT and refuses otherwise'
+      ;;
+    tmpfs|ramfs)
+      warn "NC_ROOT is on $NC_ROOT_FSTYPE, which lives in RAM: every file would be lost at the next reboot, and it competes for the memory this stack is already tight on. This is almost certainly the wrong path."
+      ;;
+  esac
+}
+
+# --- 21-22. NC_ROOT NOT INSIDE THE RCLONE PIPELINE -------------------------
+
+collect_guards() {
+  local key extra
+  GUARDS=()
+
+  if [[ -r "$NC_CONF" ]]; then
+    for key in "${GUARD_KEYS[@]}"; do
+      if cnc_lookup "$key"; then
+        if [[ -n "$CNC_VALUE" ]]; then
+          GUARDS+=("$CNC_VALUE")
+          note "  $key = $CNC_VALUE"
+        fi
+      else
+        note "  $key is not set in $NC_CONF"
+      fi
+    done
+  fi
+
+  if (( ${#opt_guards[@]} > 0 )); then
+    for extra in "${opt_guards[@]}"; do
+      GUARDS+=("$extra")
+      note "  --guard $extra"
+    done
+  fi
+}
+
+check_containment() {
+  section 'NC_ROOT NOT INSIDE THE RCLONE PIPELINE'
+  local subject p
+
+  note "reading $NC_CONF by grep, never by sourcing:"
+  collect_guards
+
+  if (( ${#GUARDS[@]} == 0 )); then
+    warn 'no cloud-nas paths were resolved, so the containment guard has nothing to test against. The pipeline checks below decide whether that is acceptable.'
+    return 0
+  fi
+
+  # while IFS= read -r, never for p in $(...): a single space in an rclone path
+  # would word-split into two bogus guards and silently defeat the most
+  # safety-critical check in the installer.
+  for subject in "$opt_root" "${CONTAINMENT_SUBJECTS[@]}"; do
+    while IFS= read -r p; do
+      [[ -n "$p" ]] || continue
+      if path_is_within "$subject" "$p"; then
+        die \
+          'tested containment in both directions between the Nextcloud paths and every cloud-nas path' \
+          "$subject is inside rclone-managed $p" \
+          'a Nextcloud tree outside every cloud-nas volume' \
+          'rclone sync would either delete Nextcloud files or mirror its appdata and previews up to Google Drive and OneDrive. Choose a path outside every cloud-nas volume.'
+      fi
+      if path_is_within "$p" "$subject"; then
+        die \
+          'tested containment in both directions between the Nextcloud paths and every cloud-nas path' \
+          "Pipeline path $p is inside $subject" \
+          'no cloud-nas path beneath the Nextcloud tree or the Docker stores' \
+          'NC_ROOT must contain nothing but Nextcloud. Choose a different path.'
+      fi
+    done < <(printf '%s\n' "${GUARDS[@]}")
+  done
+
+  note "containment: $opt_root, /var/lib/docker and /var/lib/containerd are all outside ${#GUARDS[@]} cloud-nas paths, in both directions"
+}
+
+# --- 23. PIPELINE PRESENT BUT UNCONFIGURED ---------------------------------
+
+PIPELINE_SYNC=
+PIPELINE_BACKUP=
+
+check_pipeline_configured() {
+  section 'CLOUD-NAS PIPELINE'
+  local cmd found=() units
+
+  PIPELINE_SYNC="$NC_OWNER_HOME/.local/bin/cloud-nas-sync"
+  PIPELINE_BACKUP="$NC_OWNER_HOME/.local/bin/cloud-nas-backup-to-nas02"
+
+  for cmd in "$NC_OWNER_HOME/.local/bin/cloud-nas-lib" "$PIPELINE_SYNC" "$PIPELINE_BACKUP"; do
+    if [[ -e "$cmd" ]]; then
+      found+=("$cmd")
+    fi
+  done
+
+  units=$(run_user_systemctl list-unit-files 'cloud-nas*' --no-legend --no-pager 2>/dev/null | awk '{ print $1 }' || true)
+
+  if [[ -r "$NC_CONF" ]]; then
+    note "config:     $NC_CONF is readable"
+    if (( ${#found[@]} > 0 )); then
+      note 'pipeline commands:'
+      printf '  %s\n' "${found[@]}"
+    fi
+    if [[ -n "$units" ]]; then
+      note 'pipeline user units:'
+      printf '  %s\n' "$units"
+    fi
+    return 0
+  fi
+
+  if (( ${#found[@]} > 0 )) || [[ -n "$units" ]]; then
+    die \
+      'checked for the cloud-nas pipeline independently of its config file' \
+      "found ${found[*]:-no commands} / ${units:-no units}, but no readable config at $NC_CONF" \
+      'a readable cloud-nas.conf whose paths the containment guard can be built from' \
+      'Absence of the config is NOT evidence the pipeline is absent, and guessing its paths is how Nextcloud data ends up inside the rclone mirror. Pass --conf or --guard explicitly.'
+  fi
+
+  warn "No cloud-nas pipeline detected at all (no config at $NC_CONF, no ~/.local/bin/cloud-nas-* commands, no cloud-nas user units). If it should be here, this is not the machine you think it is - stop."
+}
+
+# --- 24. PIPELINE SCRIPTS READ, NOT EXECUTED -------------------------------
+
+check_pipeline_scripts() {
+  section 'PIPELINE SCRIPTS (read, never executed)'
+  local f paths calls snapshots=0
+
+  for f in "$PIPELINE_SYNC" "$PIPELINE_BACKUP"; do
+    [[ -r "$f" ]] || continue
+    note "-- $f"
+
+    paths=$(grep -noE '/[A-Za-z0-9._][A-Za-z0-9._/-]+' -- "$f" 2>/dev/null | sort -u -t: -k2 | awk 'NR <= 40' || true)
+    if [[ -n "$paths" ]]; then
+      note '   absolute paths mentioned:'
+      printf '     %s\n' "$paths"
+    fi
+
+    calls=$(grep -nE 'rclone|rsync|btrfs[[:space:]]+subvolume|zfs[[:space:]]+(snapshot|send)|snapshot' -- "$f" 2>/dev/null | awk 'NR <= 40' || true)
+    if [[ -n "$calls" ]]; then
+      note '   transfer and snapshot invocations:'
+      printf '     %s\n' "$calls"
+      if printf '%s' "$calls" | grep -qE 'btrfs[[:space:]]+subvolume|zfs[[:space:]]+(snapshot|send)|snapshot'; then
+        snapshots=1
+      fi
+    fi
+  done
+
+  if (( snapshots == 1 )); then
+    warn "The NAS_02 job appears to take filesystem-level snapshots. A directory-level containment test cannot see a filesystem-level snapshot - confirm by eye that $opt_root is not swept up by it."
+  fi
+}
+
+# --- 25. USER MANAGER REACHABLE --------------------------------------------
+
+check_user_manager() {
+  section 'OWNER SYSTEMD USER MANAGER'
+  local out linger runtime
+
+  # Never a bare systemctl --user: after the sudo re-exec that queries root's
+  # user manager and reports a false all-clear for the cloud-nas timers.
+  if ! out=$(run_user_systemctl list-unit-files 'cloud-nas*' --no-legend --no-pager 2>&1); then
+    die \
+      "queried $NC_OWNER's systemd user manager for the cloud-nas units" \
+      "${out:-the command failed with no output}" \
+      "a reachable user manager on /run/user/$NC_OWNER_UID/bus" \
+      "Log in as $NC_OWNER (so the user manager and its bus exist) and re-run. A bare 'systemctl --user' here would query root's manager and report a false all-clear."
+  fi
+  note "user manager reachable; cloud-nas unit files: ${out:-none}"
+
+  linger=$(loginctl show-user "$NC_OWNER" --property=Linger --value 2>/dev/null || true)
+  if [[ -z "$linger" ]]; then
+    if [[ -e "/var/lib/systemd/linger/$NC_OWNER" ]]; then
+      linger=yes
+    else
+      linger=unknown
+    fi
+  fi
+  if [[ -d "/run/user/$NC_OWNER_UID" ]]; then
+    runtime=present
+  else
+    runtime=ABSENT
+  fi
+
+  # Reported, never changed: this is the owner's decision, not the script's.
+  warn "Linger=$linger and /run/user/$NC_OWNER_UID is $runtime. If lingering is off, the cloud-nas timers are only running while you are logged in - and this project involves a reboot. That is your decision, not this script's."
+}
+
+# --- 26. NO SYNC IN FLIGHT -------------------------------------------------
+
+timer_seconds_left() {
+  local unit=$1 raw secs now uptime
+  raw=$(run_user_systemctl show "$unit" -p NextElapseUSecRealtime --value --no-pager 2>/dev/null || true)
+  if [[ "$raw" =~ ^[0-9]+$ ]] && (( raw > 0 )); then
+    now=$(date +%s)
+    printf '%s\n' $(( raw / 1000000 - now ))
+    return 0
+  fi
+  if [[ -n "$raw" && ! "$raw" =~ ^[0-9]+$ ]]; then
+    secs=$(date -d "$raw" +%s 2>/dev/null || true)
+    if [[ "$secs" =~ ^[0-9]+$ ]]; then
+      now=$(date +%s)
+      printf '%s\n' $(( secs - now ))
+      return 0
+    fi
+  fi
+  raw=$(run_user_systemctl show "$unit" -p NextElapseUSecMonotonic --value --no-pager 2>/dev/null || true)
+  if [[ "$raw" =~ ^[0-9]+$ ]] && (( raw > 0 )); then
+    uptime=$(awk '{ print int($1) }' /proc/uptime)
+    printf '%s\n' $(( raw / 1000000 - uptime ))
+    return 0
+  fi
+  return 1
+}
+
+check_no_sync_in_flight() {
+  section 'NO SYNC IN FLIGHT'
+  local pids running unit state left load cores pid
+
+  pids=$(pgrep -u "$NC_OWNER" -f 'rclone|cloud-nas-' 2>/dev/null || true)
+  running=$(printf '%s\n' "$pids" | awk -v me="$$" -v parent="$PPID" '$0 != "" && $0 != me && $0 != parent')
+  if [[ -n "$running" ]]; then
+    note 'processes matched:'
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      printf '  %s\n' "$(ps -o pid=,args= -p "$pid" 2>/dev/null || printf '%s (gone)' "$pid")"
+    done <<<"$running"
+    die \
+      "checked for running rclone and cloud-nas processes owned by $NC_OWNER" \
+      "pids $(printf '%s' "$running" | tr '\n' ' ')" \
+      'an idle pipeline' \
+      'An rclone sync is running. Installing now pins all four cores of an N5105 that has no hyperthreading and competes for the array. Wait.'
+  fi
+
+  while IFS= read -r unit; do
+    [[ -n "$unit" ]] || continue
+    case "$unit" in
+      *.service)
+        state=$(run_user_systemctl is-active "$unit" --no-pager 2>/dev/null || true)
+        if [[ "$state" == active ]]; then
+          die \
+            "checked run_user_systemctl is-active on each cloud-nas unit" \
+            "$unit is $state" \
+            'no cloud-nas service running' \
+            'A cloud-nas job is running now. Installing now pins all four cores of an N5105 that has no hyperthreading and competes for the array. Wait.'
+        fi
+        ;;
+      *.timer)
+        if left=$(timer_seconds_left "$unit"); then
+          if (( left > 0 && left < INSTALL_WINDOW_SECS )); then
+            die \
+              'read the next elapse of every cloud-nas timer from the owner user manager' \
+              "$unit fires in ${left}s" \
+              "nothing scheduled inside the next ${INSTALL_WINDOW_SECS}s install window" \
+              'A cloud-nas timer fires inside the install window. Installing now pins all four cores of an N5105 that has no hyperthreading and competes for the array. Wait.'
+          fi
+          note "  $unit fires in ${left}s"
+        else
+          warn "could not read the next elapse of $unit; check 'systemctl --user list-timers --all' by eye before continuing."
+        fi
+        ;;
+    esac
+  done < <(run_user_systemctl list-unit-files 'cloud-nas*' --no-legend --no-pager 2>/dev/null | awk '{ print $1 }' || true)
+
+  run_user_systemctl list-timers --all 'cloud-nas*' --no-pager 2>/dev/null || true
+
+  load=$(awk '{ print $1 }' /proc/loadavg)
+  cores=$(nproc)
+  if awk -v l="$load" -v n="$cores" 'BEGIN { exit !(l > n) }'; then
+    die \
+      'compared the 1-minute load average against the core count' \
+      "load $load on $cores cores" \
+      "a 1-minute load at or below $cores" \
+      'Wait for the box to go idle.'
+  fi
+  note "load:       $load on $cores cores"
+}
+
+# --- 27. MEMORY ------------------------------------------------------------
+
+check_memory() {
+  section 'MEMORY'
+  local avail_kb swap
+
+  MEMTOTAL_KB=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
+  avail_kb=$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo)
+
+  note "memtotal:   $(human_bytes "$(( MEMTOTAL_KB * 1024 ))")"
+  note "memavail:   $(human_bytes "$(( avail_kb * 1024 ))")"
+
+  if (( MEMTOTAL_KB < MIN_MEMTOTAL_KB )); then
+    RAM_PROFILE=low
+    (( opt_accept_low_ram == 1 )) || die \
+      'read MemTotal from /proc/meminfo' \
+      "only $(( MEMTOTAL_KB / 1024 )) MiB RAM" \
+      'at least 6 GiB, or an explicit acknowledgement' \
+      'This stack is survivable at 4 GB for one user ONLY with capped workers and swap. Re-run with --accept-low-ram, or fit one 8 GB DDR4 SO-DIMM in the free slot - ASUSTOR states the AS6704T ships 4 GB (1x4GB) in 2 slots and is expandable to 16 GB (2x8GB).'
+    warn "--accept-low-ram given: the installer will use the capped profile (app 1280m, PHP_MEMORY_LIMIT 512M, MaxRequestWorkers 8, db 512m, redis 128m, cron 512m)."
+  else
+    RAM_PROFILE=standard
+  fi
+
+  swap=$(swapon --show --noheadings 2>/dev/null || true)
+  if [[ -n "$swap" ]]; then
+    note 'swap:'
+    printf '  %s\n' "$swap"
+  elif (( opt_setup_zram == 1 )); then
+    warn '--setup-zram given: no swap exists yet, and the installer must create zram before Docker starts. Preflight is accepting the gap, not the absence.'
+  else
+    die \
+      'checked swapon --show for any swap or zram device' \
+      'no swap and no zram is configured' \
+      'at least one swap or zram device' \
+      "On 4 GB an OOM event can select tailscaled, and a headless tailnet-only NAS that loses tailscaled needs physical access. Run 'nextcloud-install --setup-zram' first, or add a swapfile."
+  fi
+
+  (( avail_kb >= MIN_MEMAVAIL_KB )) || die \
+    'read MemAvailable from /proc/meminfo' \
+    "$(( avail_kb / 1024 )) MiB available right now" \
+    'at least 1.2 GiB available before the first container starts' \
+    'Something on this box is already using the memory this stack needs. Find it, or wait for the rclone sync to finish, then re-run.'
+}
+
+# --- 28. DISK --------------------------------------------------------------
+
+check_disk() {
+  section 'DISK'
+  local free pct mnt
+
+  if ! free=$(free_bytes /var/lib); then
+    die \
+      'asked df for free space on the filesystem holding /var/lib' \
+      'df did not answer' \
+      'a readable filesystem under /var/lib' \
+      'check that /var/lib is on a mounted filesystem'
+  fi
+  mnt=$(mnt_of /var/lib || true)
+  note "/var/lib:   $(human_bytes "$free") free on ${mnt:-unknown}"
+
+  (( free >= MIN_VARLIB_BYTES )) || die \
+    'checked free space on the filesystem holding /var/lib, where both /var/lib/docker and /var/lib/containerd live' \
+    "$(human_bytes "$free") free on ${mnt:-unknown}" \
+    '15 GiB free; the images for this stack are 1.5-2.5 GiB before any data' \
+    'On Docker 29 the containerd image store under /var/lib/containerd is separate from data-root - Docker own docs say "The data-root option does not affect image and container data stored in /var/lib/containerd". This installer will NOT relocate either store. Free space, or relocate manually: set "data-root" in /etc/docker/daemon.json AND the root = line in /etc/containerd/config.toml (generate that file on the box with: containerd config default, then edit only the root line - Arch ships containerd 2.x, whose default config is version 3, so do not paste a version-2 snippet from the docs).'
+
+  if ! free=$(free_bytes "$opt_root"); then
+    die \
+      'asked df for free space on the filesystem that would hold NC_ROOT' \
+      'df did not answer' \
+      'a readable filesystem under NC_ROOT' \
+      'check that the array is mounted'
+  fi
+  if ! pct=$(used_pct "$opt_root"); then
+    die \
+      'asked df for the used percentage of the filesystem that would hold NC_ROOT' \
+      'df did not answer' \
+      'a readable filesystem under NC_ROOT' \
+      'check that the array is mounted'
+  fi
+  note "nc_root fs: $(human_bytes "$free") free, ${pct}% used on $NC_ROOT_MNT"
+
+  (( free >= MIN_ROOT_BYTES )) || die \
+    'checked free space on the filesystem that would hold NC_ROOT' \
+    "$(human_bytes "$free") free on $NC_ROOT_MNT" \
+    '20 GiB free' \
+    'Nothing bounds Nextcloud growth between runs. Free space on the array, or choose a volume with room.'
+
+  (( pct <= MAX_ROOT_PCT )) || die \
+    'checked the used percentage of the filesystem that would hold NC_ROOT' \
+    "$NC_ROOT_MNT is ${pct}% used" \
+    "at most ${MAX_ROOT_PCT}% used" \
+    'The cloud mirror needs room to grow; a Nextcloud data directory that fills this volume breaks the backup pipeline the whole box exists for.'
+}
+
+# --- 29. NC_ROOT EMPTY OR OURS ---------------------------------------------
+
+check_root_empty() {
+  section 'NC_ROOT EMPTY OR OURS'
+  local entries
+
+  if [[ ! -e "$opt_root" ]]; then
+    note "nc_root:    $opt_root does not exist yet; nextcloud-install will create it on ${NC_ROOT_FSTYPE:-unknown}"
+    return 0
+  fi
+
+  [[ -d "$opt_root" ]] || die \
+    'checked what NC_ROOT already is' \
+    "$opt_root exists and is not a directory" \
+    'a directory, or nothing at all' \
+    'choose a fresh path'
+
+  entries=$(find "$opt_root" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort | awk 'NR <= 8' || true)
+  if [[ -z "$entries" ]]; then
+    note "nc_root:    $opt_root exists and is empty"
+    return 0
+  fi
+
+  if [[ -e "$opt_root/.nextcloud-trial-owned" ]]; then
+    note "nc_root:    $opt_root carries the .nextcloud-trial-owned marker"
+    return 0
+  fi
+
+  die \
+    'checked whether a non-empty NC_ROOT carries the .nextcloud-trial-owned marker' \
+    "$opt_root is non-empty and has no marker (contents: $(printf '%s' "$entries" | tr '\n' ' '))" \
+    'an empty path, or one this installer created' \
+    'This installer will not adopt data it did not create. Choose a fresh path.'
+}
+
+# --- 30. NO CONFLICTING DOCKER OBJECTS -------------------------------------
+
+check_docker_objects() {
+  section 'DOCKER OBJECTS'
+  local containers volumes networks strays
+
+  if have docker; then
+    DOCKER_PRESENT=1
+  fi
+  if (( DOCKER_PRESENT == 0 )); then
+    warn 'docker is not installed, so no existing container, volume or network could be inspected. nextcloud-install refuses on this and points at --install-docker.'
+    return 0
+  fi
+
+  # Asking the daemon anything starts it when only docker.socket is enabled.
+  note 'querying the Docker daemon (this starts dockerd if docker.socket is enabled)'
+  local info_out=
+  if info_out=$(docker info 2>&1); then
+    DOCKER_OK=1
+  fi
+  if (( DOCKER_OK == 0 )); then
+    warn 'the docker CLI is present but the daemon did not answer, so existing project objects are UNVERIFIED. nextcloud-install repeats this check.'
+    return 0
+  fi
+
+  # The storage driver is READ, never predicted from the filesystem type.
+  note "docker:     $(docker info --format '{{.Driver}} {{.DockerRootDir}} {{.CgroupDriver}}/{{.CgroupVersion}}' 2>/dev/null || printf unknown)"
+  if printf '%s\n' "$info_out" | grep -q 'No memory limit support'; then
+    die \
+      'read the WARNING lines from docker info' \
+      'docker info reports: No memory limit support' \
+      'a daemon that can enforce mem_limit' \
+      'A mem_limit Docker accepts but does not enforce is worse than no limit at all - it removes the only mechanism keeping a Nextcloud spike from OOM-killing the rclone sync. Refusing.'
+  fi
+
+  containers=$(docker ps -a --filter "label=com.docker.compose.project=$opt_project" --format '{{.Names}}' 2>/dev/null || true)
+  volumes=$(docker volume ls --format '{{.Name}}' 2>/dev/null | grep "^${opt_project}_" || true)
+  networks=$(docker network ls --format '{{.Name}}' 2>/dev/null | grep -x "${opt_project}_default" || true)
+  strays=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^(nextcloud|nextcloud-aio-)' || true)
+
+  if [[ -n "$containers$volumes$networks$strays" ]]; then
+    die \
+      "checked for containers, volumes, networks and stray nextcloud* objects carrying the $opt_project project" \
+      "containers: ${containers:-none}; volumes: ${volumes:-none}; networks: ${networks:-none}; other nextcloud containers: ${strays:-none}" \
+      'no existing objects in this project' \
+      "docker compose up may adopt containers with a matching project label rather than erroring. Run nextcloud-uninstall, or pass --project <other-name>."
+  fi
+
+  note "objects:    nothing carries the $opt_project project label"
+}
+
+# --- 31. PORT FREE ---------------------------------------------------------
+
+check_port() {
+  section 'PORT'
+  local listeners
+
+  if ! [[ "$opt_port" =~ ^[0-9]+$ ]] || (( opt_port < 1 || opt_port > 65535 )); then
+    die \
+      'checked that --port is a usable TCP port' \
+      "--port '$opt_port'" \
+      'an integer from 1 to 65535' \
+      'pass something like --port 8080'
+  fi
+
+  have ss || die \
+    'checked for the ss command from iproute2' \
+    'ss is not on PATH' \
+    'ss, so every local listener can be enumerated' \
+    'install iproute2; without it a port collision would only be discovered when the container fails to start'
+
+  # All local addresses, not just 127.0.0.1: a listener on 0.0.0.0 or [::]
+  # collides just as hard.
+  listeners=$(ss -H -ltnp "sport = :${opt_port}" 2>/dev/null || true)
+  [[ -z "$listeners" ]] || die \
+    "checked every local listener on port $opt_port" \
+    "$listeners" \
+    'nothing listening on that port' \
+    "Port $opt_port is already bound. Pass --port <free port>."
+
+  note "port:       127.0.0.1:$opt_port is free"
+}
+
+# --- 32. BRIDGE SUBNET FREE ------------------------------------------------
+
+check_subnet() {
+  section 'BRIDGE SUBNET'
+  local in_use=() route cand clash line
+
+  while IFS= read -r line; do
+    route=${line%% *}
+    case "$route" in
+      default|'') continue ;;
+    esac
+    if [[ "$route" != */* ]]; then
+      route="$route/32"
+    fi
+    if is_cidr "$route"; then
+      in_use+=("$route")
+    fi
+  done < <(ip -4 route show 2>/dev/null || true)
+
+  if (( DOCKER_OK == 1 )); then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      if is_cidr "$line"; then
+        in_use+=("$line")
+      fi
+    done < <(docker network ls -q 2>/dev/null | xargs -r docker network inspect --format '{{range .IPAM.Config}}{{println .Subnet}}{{end}}' 2>/dev/null || true)
+  fi
+
+  note "routes and docker IPAM already using ${#in_use[@]} prefixes"
+
+  for cand in "${in_use[@]}"; do
+    if cidr_overlaps "$DOCKER_DEFAULT_BRIDGE" "$cand"; then
+      warn "Docker's default bridge $DOCKER_DEFAULT_BRIDGE overlaps the existing prefix $cand. dockerd will still create docker0 there; check that nothing this box routes to lives in that range."
+      break
+    fi
+  done
+
+  if [[ -n "$opt_subnet" ]]; then
+    is_cidr "$opt_subnet" || die \
+      'checked that --subnet is a CIDR' \
+      "--subnet '$opt_subnet'" \
+      'something like 172.31.240.0/24' \
+      'pass the network in CIDR form'
+    for cand in "${in_use[@]}"; do
+      if cidr_overlaps "$opt_subnet" "$cand"; then
+        die \
+          'checked the requested bridge subnet against every route and Docker IPAM config' \
+          "--subnet $opt_subnet overlaps $cand" \
+          'a subnet that collides with nothing on this box' \
+          'Pass --subnet <CIDR> naming a range this box does not route.'
+      fi
+    done
+    NC_SUBNET=$opt_subnet
+  else
+    for cand in "${SUBNET_CANDIDATES[@]}"; do
+      clash=
+      for line in "${in_use[@]}"; do
+        if cidr_overlaps "$cand" "$line"; then
+          clash=$line
+          break
+        fi
+      done
+      if [[ -z "$clash" ]]; then
+        NC_SUBNET=$cand
+        break
+      fi
+      note "  $cand is taken by $clash"
+    done
+  fi
+
+  [[ -n "$NC_SUBNET" ]] || die \
+    "checked ${SUBNET_CANDIDATES[*]} against every route and Docker IPAM config" \
+    'all three candidates collide' \
+    'one free /24 to pin the project bridge to' \
+    'No free candidate bridge subnet. Pass --subnet <CIDR>.'
+
+  # Pinned explicitly because it is used VERBATIM as TRUSTED_PROXIES, so it must
+  # be deterministic and never chosen by Docker.
+  note "subnet:     $NC_SUBNET (used verbatim as TRUSTED_PROXIES)"
+}
+
+# --- 33 + 43. IMAGE TAGS RESOLVE / REGISTRY REACHABLE ----------------------
+
+check_images() {
+  section 'IMAGE TAGS'
+  local tag
+
+  if (( DOCKER_PRESENT == 0 )); then
+    warn "docker is not installed, so $NC_IMAGE, $DB_IMAGE and $REDIS_IMAGE are UNVERIFIED and registry reachability is untested. This is the last cheap failure point before the first docker pull, and nextcloud-install repeats it."
+    return 0
+  fi
+
+  for tag in "$NC_IMAGE" "$DB_IMAGE" "$REDIS_IMAGE"; do
+    docker manifest inspect "$tag" >/dev/null 2>&1 || die \
+      'resolved every image tag against the registry before any directory is created' \
+      "docker manifest inspect $tag failed" \
+      'a tag that resolves' \
+      "Image tag $tag does not resolve. Either the registry is unreachable from this box or the tag is wrong. NOTE: nextcloud:34.0.2-apache was confirmed present on Docker Hub on 2026-08-13 (last updated 2026-08-12); redis:8-alpine was NOT independently verified and may need to become redis:7-alpine."
+    note "  $tag resolves"
+  done
+
+  IMAGES_VERIFIED=1
+  note 'registry:   reachable (the manifest lookups above double as that check)'
+}
+
+# --- 34 + 42. IMAGE UID PROBE / CRON ENTRYPOINT ----------------------------
+
+check_image_probes() {
+  section 'IMAGE PROBES'
+  local uid gid
+
+  if (( DOCKER_OK == 0 )) || ! docker image inspect "$NC_IMAGE" >/dev/null 2>&1; then
+    note "deferred:   $NC_IMAGE is not in the local image store, and probing it here would pull it - a preflight that changes nothing must not."
+    note '            nextcloud-install runs the uid probe and the /cron.sh test after the manifest check and before it chowns anything.'
+    return 0
+  fi
+
+  uid=$(docker run --rm --entrypoint id "$NC_IMAGE" -u www-data 2>/dev/null || true)
+  gid=$(docker run --rm --entrypoint id "$NC_IMAGE" -g www-data 2>/dev/null || true)
+
+  [[ "$uid" =~ ^[0-9]+$ ]] || die \
+    "probed the www-data uid inside $NC_IMAGE" \
+    "got '${uid:-nothing}'" \
+    'a bare integer' \
+    'Do NOT hardcode 33 - it is right for the Debian apache/fpm variants and wrong for Alpine (82). Nothing will be chowned until this probe succeeds.'
+  [[ "$gid" =~ ^[0-9]+$ ]] || die \
+    "probed the www-data gid inside $NC_IMAGE" \
+    "got '${gid:-nothing}'" \
+    'a bare integer' \
+    'Do NOT hardcode 33. Nothing will be chowned until this probe succeeds.'
+
+  IMAGE_WWW_UID=$uid
+  IMAGE_WWW_GID=$gid
+  note "www-data:   uid $uid, gid $gid (probed, never hardcoded)"
+
+  if docker run --rm --entrypoint sh "$NC_IMAGE" -c 'test -x /cron.sh' >/dev/null 2>&1; then
+    CRON_ENTRYPOINT=present
+    note 'cron:       /cron.sh is present, so the cron sidecar is viable'
+  else
+    CRON_ENTRYPOINT=absent
+    warn '/cron.sh not found in this image tag; leaving Nextcloud in AJAX cron mode and omitting the cron sidecar. Do NOT invent a host systemd timer - that is residue the uninstaller must chase.'
+  fi
+}
+
+# --- 35-37. CHECKS THAT BELONG TO THE INSTALL RUN --------------------------
+
+check_deferred_gates() {
+  section 'GATES DEFERRED TO nextcloud-install'
+  note "bind-mount writability: needs $opt_root/data to exist and be chowned first; the installer proves it with a docker run --entrypoint sh -u uid:gid touch/rm probe before the stack is created."
+  note 'no user: key on app or cron: asserted against the compose file the installer generates. The image entrypoint must start as root to fix permissions and bind port 80 before dropping to www-data.'
+  note "compose validates: docker compose config is the installer hard gate before pull or up, so the \${VAR:?} guards name a missing variable instead of substituting empty."
+  note "127.0.0.1 publish: the installer greps its own generated compose file for the 127.0.0.1: prefix before up. Published ports are DNAT'd ahead of INPUT, so an unqualified publish is not saved by any host firewall."
+}
+
+# --- 38. CLOCK -------------------------------------------------------------
+
+check_clock() {
+  section 'CLOCK'
+  local synced
+
+  synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)
+  [[ "$synced" == yes ]] || die \
+    'read NTPSynchronized from timedatectl' \
+    "NTPSynchronized=${synced:-unreadable}" \
+    'yes' \
+    "System clock is not NTP-synchronised. Let's Encrypt validation and TLS verification both fail on a skewed clock, and a NAS that has been powered down drifts. Enable it with: timedatectl set-ntp true"
+
+  note "clock:      NTP synchronised ($(date -u '+%Y-%m-%dT%H:%M:%SZ'))"
+}
+
+# --- 39. SUBNET ROUTER / EXIT NODE -----------------------------------------
+
+check_subnet_router() {
+  section 'SUBNET ROUTER / EXIT NODE'
+
+  # Asked, never detected: tailscale debug prefs is an undocumented debug
+  # subcommand, and AdvertiseRoutes is a prefs field that does not reliably
+  # appear in tailscale status --json.
+  if have jq; then
+    note "  .Self.ExitNodeOption: $(jq -r '.Self.ExitNodeOption // "unknown"' "$TS_STATUS_JSON" 2>/dev/null || printf unknown)"
+    note "  .Self.PrimaryRoutes:  $(jq -r '(.Self.PrimaryRoutes // []) | join(", ")' "$TS_STATUS_JSON" 2>/dev/null || printf unknown)"
+    note '  (absence of either is unknown, not false)'
+  fi
+
+  if [[ "$opt_subnet_router" == unanswered ]]; then
+    if ! [[ -t 0 ]]; then
+      die \
+        'checked for an answer about subnet routing and exit-node duty' \
+        'neither --subnet-router nor --no-subnet-router was given, and stdin is not a terminal to ask on' \
+        'an explicit answer' \
+        'This cannot be reliably auto-detected. If yes, the installer pre-sets net.ipv4.ip_forward=1 before Docker first starts, so Docker does not set a drop policy on forwarded packets. Pass --subnet-router or --no-subnet-router.'
+    fi
+    if confirm 'Does ArchNAS advertise Tailscale subnet routes or act as an exit node?'; then
+      # An answer typed here reaches this process only. nextcloud-install reads
+      # its own flags, so a yes that is not also a flag would leave the sysctl
+      # file unwritten and the divergence invisible.
+      die \
+        'asked whether this node advertises subnet routes or is an exit node' \
+        'answered yes at the prompt, but --subnet-router was not on the command line' \
+        'the answer given as a flag, so nextcloud-install sees the same one' \
+        'Re-run with --subnet-router. That flag is what makes the installer write /etc/sysctl.d/99-nextcloud-trial-forward.conf and apply it BEFORE Docker first starts; without it the installer treats this node as neither a subnet router nor an exit node, and Docker sets a drop policy on forwarded packets the first time it enables IP forwarding.'
+    fi
+    opt_subnet_router=no
+  fi
+
+  if [[ "$opt_subnet_router" == yes ]]; then
+    note 'routing:    yes - the installer will write /etc/sysctl.d/99-nextcloud-trial-forward.conf and apply it BEFORE Docker ever starts'
+  else
+    note 'routing:    no - no sysctl file will be written'
+  fi
+}
+
+# --- 40. CT-LOG CONSENT ----------------------------------------------------
+
+check_ct_log() {
+  section 'CERTIFICATE TRANSPARENCY CONSENT'
+
+  (( opt_accept_ct_log == 1 )) || die \
+    'checked for --accept-ct-log' \
+    'the flag was not given' \
+    'an explicit acknowledgement before any certificate is requested' \
+    "Enabling tailnet HTTPS publishes $NC_FQDN to the public Certificate Transparency ledger. Tailscale documents this: \"All TLS certificates on the web are recorded in the Certificate Transparency (CT) append-only public ledger, which anyone can access.\" This is the one effect of this whole project that no teardown can undo. Pass --accept-ct-log to acknowledge."
+
+  note "consent:    --accept-ct-log given for $NC_FQDN"
+}
+
+# --- 41. NO CERT RETRY LOOP ------------------------------------------------
+
+check_cert_retry_loop() {
+  section 'NO CERT RETRY LOOP'
+  local installer=/usr/local/bin/nextcloud-install ctx scan
+
+  if [[ ! -r "$installer" ]]; then
+    warn "nextcloud-install is not installed at $installer, so its cert handling could not be inspected. Tailscale documents that exceeding Let's Encrypt rate limits can mean \"waiting 34 hours until you can try again\"; confirm by eye that nothing retries tailscale serve or tailscale cert."
+    return 0
+  fi
+
+  ctx=$(grep -nE -B 5 'tailscale[[:space:]]+(serve|cert)' -- "$installer" 2>/dev/null || true)
+  if [[ -z "$ctx" ]]; then
+    note 'installer:  no tailscale serve or cert invocation found'
+    return 0
+  fi
+
+  # The grep line-number prefix and any comment are stripped first, so that a
+  # comment explaining why there is no retry is not itself read as one.
+  scan=$(printf '%s\n' "$ctx" | sed -e 's/^[0-9]*[-:]//' -e 's/#.*$//')
+  if printf '%s\n' "$scan" | grep -qE '^[[:space:]]*(while|until|for)[[:space:]]|(^|[;&|[:space:]])retry([[:space:]]|$)'; then
+    note 'context:'
+    printf '  %s\n' "$ctx"
+    die \
+      'inspected nextcloud-install for a retry around tailscale serve or tailscale cert' \
+      'a loop or retry keyword sits within five lines of a tailscale serve/cert call' \
+      'a single, unretried invocation' \
+      "Tailscale documents: \"It is possible to frequently request a new certificate and exceed Let's Encrypt's rate limits. As a result, you may find yourself waiting 34 hours until you can try again.\" A script the owner re-runs while tuning is exactly the pattern that trips this. Remove the loop."
+  fi
+
+  note 'installer:  tailscale serve/cert invoked without a retry loop'
+}
+
+# --- 44. APP-STORE REACHABILITY --------------------------------------------
+
+check_app_store() {
+  section 'APP-STORE REACHABILITY'
+  note 'not checked here: apps.nextcloud.com only matters to nextcloud-push-enable, which probes it before occ app:install because a failed install makes the app:enable fallback fail too, with a misleading error. notify_push is deliberately not part of v1.'
+}
+
+# --- baseline --------------------------------------------------------------
+
+cap() {
+  local name=$1
+  shift
+  local out="$BASELINE_DIR/$name"
+  if "$@" >"$out" 2>"$out.err"; then
+    :
+  else
+    printf 'exit status %s\n' "$?" >>"$out.err"
+  fi
+  if [[ ! -s "$out.err" ]]; then
+    rm -f -- "$out.err"
+  fi
+  # A missing command must never abort the capture, so this always succeeds.
+  return 0
+}
+
+capture_baseline() {
+  section 'BASELINE'
+  local stamp f u
+
+  # Written only after every check has passed, so nextcloud-postflight - which
+  # diffs against the newest baseline-* directory - can never pick up a partial
+  # capture from a run that refused halfway.
+  stamp=$(date -u +%Y%m%dT%H%M%SZ)
+  BASELINE_DIR="$STATE_DIR/baseline-$stamp"
+  install -d -m 0700 -- "$BASELINE_DIR"
+
+  cap lsmod lsmod
+  cap uname-r uname -r
+  cap proc-cmdline cat /proc/cmdline
+  cap modprobe.d ls -la /etc/modprobe.d
+  cap sys-class-leds ls -la /sys/class/leds
+  cap dkms-status dkms status
+  cap pacman-Q-linux pacman -Q linux
+  cap pacman-Qq pacman -Qq
+  cap pacman-Qe pacman -Qe
+  cap lsblk-f lsblk -f
+  cap findmnt findmnt -R -o TARGET,SOURCE,FSTYPE,OPTIONS
+  cap df-h df -h
+  cap free-b free -b
+  cap swapon swapon --show
+  cap sysctl-forward sysctl net.ipv4.ip_forward net.ipv6.conf.all.forwarding
+  cap iptables-save iptables-save
+  cap ip6tables-save ip6tables-save
+  cap nft-ruleset nft list ruleset
+  cap ss-ltn ss -ltn
+  cap loginctl-show-user loginctl show-user "$NC_OWNER"
+  cap tailscale-status tailscale status --json
+  cap tailscale-serve-status tailscale serve status --json
+  cap user-unit-files run_user_systemctl list-unit-files --no-pager
+  cap user-timers run_user_systemctl list-timers --all --no-pager
+
+  : >"$BASELINE_DIR/asustor-hwmon-name"
+  for f in /sys/devices/platform/asustor_it87.*/hwmon/hwmon*/name; do
+    [[ -r "$f" ]] || continue
+    printf '%s %s\n' "$f" "$(cat -- "$f" 2>/dev/null || printf unreadable)" >>"$BASELINE_DIR/asustor-hwmon-name"
+  done
+
+  : >"$BASELINE_DIR/systemd-units"
+  for u in docker.service docker.socket containerd.service tailscaled.service sshd; do
+    printf '%s is-enabled=%s is-active=%s\n' \
+      "$u" \
+      "$(systemctl is-enabled "$u" 2>&1 | awk 'NR == 1' || true)" \
+      "$(systemctl is-active "$u" 2>&1 | awk 'NR == 1' || true)" \
+      >>"$BASELINE_DIR/systemd-units"
+  done
+
+  if [[ -r "$NC_CONF" ]]; then
+    install -m 0600 -- "$NC_CONF" "$BASELINE_DIR/cloud-nas.conf"
+  fi
+
+  if (( DOCKER_OK == 1 )); then
+    cap docker-info docker info
+    cap docker-ps-a docker ps -a
+    cap docker-volume-ls docker volume ls
+    cap docker-network-ls docker network ls
+  fi
+
+  note "baseline:   $BASELINE_DIR"
+  note "files:      $(find "$BASELINE_DIR" -type f | awk 'END { print NR }')"
+}
+
+# --- summary ---------------------------------------------------------------
+
+print_summary() {
+  local cmd images_state
+
+  if (( IMAGES_VERIFIED == 1 )); then
+    images_state='all resolve'
+  else
+    images_state='UNVERIFIED'
+  fi
+
+  section 'DISCOVERY SUMMARY'
+  printf 'owner:        %s (uid %s)\n' "$NC_OWNER" "$NC_OWNER_UID"
+  printf 'fqdn:         %s (from %s)\n' "$NC_FQDN" "$NC_FQDN_SOURCE"
+  printf 'nc_root:      %s\n' "$opt_root"
+  printf 'mount:        %s  fstype %s  source %s\n' "$NC_ROOT_MNT" "${NC_ROOT_FSTYPE:-unknown}" "${NC_ROOT_SRC:-unknown}"
+  printf 'project:      %s\n' "$opt_project"
+  printf 'publish:      127.0.0.1:%s\n' "$opt_port"
+  printf 'subnet:       %s\n' "$NC_SUBNET"
+  printf 'ram:          %s MiB, profile %s\n' "$(( MEMTOTAL_KB / 1024 ))" "$RAM_PROFILE"
+  printf 'images:       %s %s %s (%s)\n' "$NC_IMAGE" "$DB_IMAGE" "$REDIS_IMAGE" "$images_state"
+  printf 'www-data:     uid %s gid %s\n' "$IMAGE_WWW_UID" "$IMAGE_WWW_GID"
+  printf 'cron.sh:      %s\n' "$CRON_ENTRYPOINT"
+  printf 'subnet route: %s\n' "$opt_subnet_router"
+  printf 'timezone:     %s\n' "${opt_tz:-not given}"
+  printf 'admin user:   %s\n' "${opt_admin_user:-not given}"
+
+  if (( MEMTOTAL_KB >= MIN_MEMTOTAL_KB && MEMTOTAL_KB < 8 * 1024 * 1024 )); then
+    warn 'MemTotal sits between 6 and 8 GiB. The two documented profiles cover under 6 GiB and 8 GiB or more; nextcloud-install decides which one this box gets.'
+  fi
+
+  cmd="nextcloud-install --root $opt_root"
+  [[ "$opt_port" == "$DEFAULT_PORT" ]] || cmd="$cmd --port $opt_port"
+  [[ "$opt_project" == "$DEFAULT_PROJECT" ]] || cmd="$cmd --project $opt_project"
+  cmd="$cmd --subnet $NC_SUBNET --fqdn $NC_FQDN"
+  [[ -z "$opt_tz" ]] || cmd="$cmd --tz $opt_tz"
+  [[ -z "$opt_admin_user" ]] || cmd="$cmd --admin-user $opt_admin_user"
+  [[ "$opt_subnet_router" != yes ]] || cmd="$cmd --subnet-router"
+  (( opt_allow_rootfs == 0 )) || cmd="$cmd --allow-rootfs"
+  (( opt_accept_low_ram == 0 )) || cmd="$cmd --accept-low-ram"
+  (( opt_setup_zram == 0 )) || cmd="$cmd --setup-zram"
+  cmd="$cmd --accept-ct-log"
+
+  section 'NEXT'
+  printf '%s\n' "$cmd"
+  printf '\n'
+  printf 'ALL PREFLIGHT CHECKS PASSED — baseline: %s\n' "$BASELINE_DIR"
+}
+
+# --- main ------------------------------------------------------------------
+
+install -d -m 0700 -- "$STATE_DIR"
+NC_TMP=$(mktemp -d "$STATE_DIR/preflight.XXXXXX")
+
+printf '%s: read-only discovery. Nothing outside %s/ is written.\n' "$PROGRAM" "$STATE_DIR"
+
+check_identity
+check_platform
+check_hostname
+check_tailnet_identity
+check_tailscale_backend
+check_cert_domains
+check_fqdn
+check_existing_serve
+check_pacman_gates
+check_platform_driver
+check_hwmon
+check_cgroup
+check_docker_modules
+check_root_supplied
+check_root_mount
+check_containment
+check_pipeline_configured
+check_pipeline_scripts
+check_user_manager
+check_no_sync_in_flight
+check_memory
+check_disk
+check_root_empty
+check_docker_objects
+check_port
+check_subnet
+check_images
+check_image_probes
+check_deferred_gates
+check_clock
+check_subnet_router
+check_ct_log
+check_cert_retry_loop
+check_app_store
+capture_baseline
+print_summary
