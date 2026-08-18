@@ -1,0 +1,30 @@
+# /etc/nas-lcd/nas-lcd.conf
+# Sourced by nas-lcd-banner. Shell syntax.
+#
+# Preview without touching the panel:
+#     nas-lcd-banner --check
+#     systemctl restart lcd-banner
+
+# The panel is 2 rows of 16 characters. Longer text is truncated, shorter is
+# padded. Only printable ASCII survives: above 0x7F the panel uses a custom
+# HD44780-style character ROM, so a stray byte prints as an unrelated glyph.
+
+# Top row. Defaults to the hostname.
+#LCD_LINE0="ArchNAS"
+
+# Bottom row. "auto" shows the address you would SSH to, or -- when systemd
+# reports the boot as degraded -- how many units failed. Set to "" for blank,
+# or to any fixed string.
+#LCD_LINE1=auto
+
+# Serial device. The udev rule also creates /dev/asustor-lcm, which is matched
+# on the hardware address and so survives ttyS renumbering.
+#LCD_PORT=/dev/asustor-lcm
+
+# How many times to send each frame. The panel NAKs during early boot and
+# nothing here reads the NAK, so the banner re-sends instead.
+#LCD_RETRY=3
+
+# Seconds to wait before writing. The panel runs a ~6s animation after
+# power-on. The unit sets this to 5; a hand-run needs none.
+#LCD_SETTLE=0

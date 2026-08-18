@@ -1,0 +1,27 @@
+[Unit]
+Description=ASUSTOR front LCD banner
+Documentation=file:///usr/local/share/doc/asustor-nas-control/thermal-and-lcd.md
+# Ordered after the boot proper so that the bottom line can report on it: this
+# is what makes the panel say DEGRADED when a unit failed, and show the address
+# you would SSH to when it did not.
+After=multi-user.target network-online.target
+Wants=network-online.target
+ConditionPathExists=/dev/ttyS1
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The panel runs a fixed ~6s animation after power-on and NAKs everything sent
+# during it. multi-user.target is normally well past that; the settle covers a
+# fast boot, and costs nothing on a slow one.
+Environment=LCD_SETTLE=5
+ExecStart=/usr/local/bin/nas-lcd-banner
+
+# Blank the panel and drop its backlight on the way down. Without the power
+# cycle the MCU keeps displaying the last message while the box is off -- it
+# looks powered when it is not -- and does not re-initialise on the next boot.
+ExecStop=-/usr/local/bin/nas-lcd-banner --off
+ExecStop=-/bin/sh -c 'echo 0 > /sys/class/leds/power:lcd/brightness'
+
+[Install]
+WantedBy=multi-user.target

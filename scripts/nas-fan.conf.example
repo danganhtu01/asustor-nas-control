@@ -1,0 +1,50 @@
+# /etc/nas-fan/nas-fan.conf
+# Sourced by nas-fand. Shell syntax.
+#
+# Check any change without applying it:
+#     nas-fand --check          # validates, and prints the curve as a table
+#     nas-fand --dry-run        # decides against the real temperatures now
+#     systemctl restart nas-fand
+
+# Curve points, "tempC:pwm", ascending, at least two. PWM is 0-255. Between two
+# points the value is interpolated linearly; below the first and above the last
+# it is clamped.
+#
+# The default leans cool rather than quiet, because on this board the
+# alternative was 80 C at idle: it is at 47% by 60 C and 78% by 70 C. To trade
+# heat for silence, move the temperatures up -- "60:60 70:120 78:200 85:255".
+# To go the other way, move them down. Keep the first PWM at or above 60: the
+# fan is known to spin there, and a fan that stalls reports 0 RPM and moves no
+# air at all.
+#FAN_CURVE="50:60 60:120 70:200 78:255"
+
+# At or above this, full speed regardless of the curve.
+#FAN_CRIT_TEMP=85
+
+# How far the temperature must FALL before the fan is allowed to slow down.
+# Ramping up is always immediate. Without this the fan audibly oscillates
+# around every curve point.
+#FAN_HYSTERESIS=4
+
+# Seconds between decisions.
+#FAN_INTERVAL=10
+
+# Which hwmon chips to read, by name, or "auto" for every sensor reporting a
+# plausible temperature. The hottest reading wins, whatever it belongs to --
+# on a NAS a cooking NVMe controller deserves the fan as much as the CPU does.
+#
+# "auto" is what excludes this board's IT8625 thermal inputs: they are not
+# connected and read -128 C, which is outside FAN_TEMP_MIN_C. That is also why
+# the chip's own automatic mode (pwm1_enable=2) is not used -- it would
+# regulate against those same dead sensors.
+#FAN_SOURCES=auto
+#FAN_TEMP_MIN_C=0
+#FAN_TEMP_MAX_C=150
+
+# Which PWM channel drives the fan. On the AS6704T only pwm1 is wired; fan2 and
+# fan3 read 0 RPM.
+#FAN_PWM_CHANNEL=1
+
+# What every exit path writes. Stopping the service therefore spins the fan UP.
+# That is not a bug -- see the header of nas-fand.
+#FAN_FAILSAFE_PWM=255

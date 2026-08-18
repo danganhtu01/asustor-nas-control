@@ -1,0 +1,15 @@
+# ASUSTOR AS6704T front LCD (LCM MCU) -- give a named group write access.
+#
+# Matched on the hardware address, not on the node name: this box enumerates 32
+# ttyS nodes and only three are real UARTs, and their numbering is not a
+# contract. The panel is COM2 on the IT8625 Super I/O -- ACPI path
+# \_SB_.PC00.LPCB.SIOI.COM2, io 0x2F8, irq 3 -- and type 4 is PORT_16550A,
+# which excludes the phantom nodes the 8250 driver registers.
+#
+# GROUP is a system group created by scripts/install.sh. Deliberately NOT:
+#   - the uucp group, which would hand over every serial device on the machine
+#     including COM1 and any future USB serial adapter;
+#   - a non-system group such as a login group, which udev warns about and
+#     upstream intends to stop supporting;
+#   - TAG+="uaccess", because SSH sessions have no seat and the ACL never lands.
+SUBSYSTEM=="tty", KERNEL=="ttyS[0-9]*", ATTR{port}=="0x2F8", ATTR{type}=="4", GROUP="lcm", MODE="0660", SYMLINK+="asustor-lcm"

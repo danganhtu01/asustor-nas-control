@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+#
+# nas-fand -- temperature-driven fan control for ASUSTOR NAS hardware on Linux.
+#
+# WHY THIS EXISTS RATHER THAN pwm1_enable=2
+#
+# The IT8625 can regulate its own fans from its own thermal inputs. On this
+# board those inputs are not connected: temp1..3 all read -128 C. Handing the
+# chip control would mean regulating against a sensor that does not exist, and
+# the safe-looking direction of that failure is the fan idling while the CPU
+# cooks. So the curve lives here, driven by sensors that are real -- coretemp,
+# the NVMe controllers, the NICs -- and the chip stays in manual mode.
+#
+# WHAT IT DOES WHEN IT BREAKS
+#
+# Every exit path drives the fan to full. A crashed, killed, stopped or
+# misconfigured fan daemon must leave a NAS loud, not silent: silence is the
+# failure you find out about when a disk dies. This is deliberate and is why
+# stopping the service spins the fan up rather than down.
+
+set -uo pipefail
+
+readonly NAS_FAND_VERSION='1.0.0'
+
+CONF="${NAS_FAN_CONF:-/etc/nas-fan/nas-fan.conf}"
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && . "$CONF"
+
+# Curve points as "tempC:pwm", ascending. Between two points the PWM is
+# interpolated linearly; below the first and above the last it is clamped.
+# The floor is 60/255 (24%): the board shipped pinned at 51 and the fan does
+# spin there, so anything at or above that is known-good. A lower floor risks a
+# fan that stalls and reports 0 RPM. This curve leans cool rather than quiet --
+# it reaches 78% by 70 C -- because on this box the alternative was 80 C at
+# idle. Raise the temperatures to trade heat for silence.
+FAN_CURVE="${FAN_CURVE:-50:60 60:120 70:200 78:255}"
+FAN_CRIT_TEMP="${FAN_CRIT_TEMP:-85}"
+FAN_HYSTERESIS="${FAN_HYSTERESIS:-4}"
+FAN_INTERVAL="${FAN_INTERVAL:-10}"
+FAN_PWM_CHANNEL="${FAN_PWM_CHANNEL:-1}"
+FAN_FAILSAFE_PWM="${FAN_FAILSAFE_PWM:-255}"
+# Readings outside this band are not temperatures. The IT8625's own -128 C
+# disconnected inputs are excluded by the floor, with no chip named anywhere.
+FAN_TEMP_MIN_C="${FAN_TEMP_MIN_C:-0}"
+FAN_TEMP_MAX_C="${FAN_TEMP_MAX_C:-150}"
+# Space-separated hwmon chip names to read; "auto" means every sane sensor.
+FAN_SOURCES="${FAN_SOURCES:-auto}"
+
+opt_once=0 opt_dry=0 opt_check=0 opt_status=0 opt_failsafe=0
+
+usage() {
+  cat <<'USAGE'
+Usage: nas-fand [options]
+
+Temperature-driven fan control for the ASUSTOR IT8625 fan controller.
+
+Options:
+      --once       One decision, then exit (still writes, unless --dry-run)
+  -n, --dry-run    Decide and report, write nothing. Needs no root.
+      --check      Validate the configuration and hardware, then exit
+      --failsafe   Drive the fan to FAN_FAILSAFE_PWM and exit. This is what
+                   ExecStopPost runs, so a SIGKILLed daemon -- which never gets
+                   to run its own trap -- still leaves the fan at full.
+  -s, --status     Print current temperatures, PWM and RPM, then exit
+  -V, --version    Print version
+  -h, --help       This text
+
+Configuration: /etc/nas-fan/nas-fan.conf
+  FAN_CURVE        "tempC:pwm ..." ascending (default "50:60 60:120 70:200 78:255")
+  FAN_CRIT_TEMP    force full speed at or above this (default 85)
+  FAN_HYSTERESIS   degrees the temperature must fall before slowing (default 4)
+  FAN_INTERVAL     seconds between decisions (default 10)
+  FAN_SOURCES      hwmon chip names to read, or "auto" (default auto)
+  FAN_FAILSAFE_PWM what every exit path writes (default 255)
+
+Stopping this service drives the fan to full ON PURPOSE. See the header.
+USAGE
+}
+
+while (($#)); do
+  case "$1" in
+    --once)        opt_once=1 ;;
+    -n|--dry-run)  opt_dry=1; opt_once=1 ;;
+    --check)       opt_check=1 ;;
+    --failsafe)    opt_failsafe=1 ;;
+    -s|--status)   opt_status=1 ;;
+    -V|--version)  printf 'nas-fand %s\n' "$NAS_FAND_VERSION"; exit 0 ;;
+    -h|--help)     usage; exit 0 ;;
+    *) printf 'nas-fand: unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+log() { printf '%s\n' "$*"; }
+die() { printf 'nas-fand: %s\n' "$*" >&2; exit 1; }
+
+# --- hardware ---------------------------------------------------------------
+#
+# Found by chip name, never by hwmon index: the numbering is assigned in probe
+# order and is not stable across boots. Writing a fan PWM to whatever hwmon3
+# happens to be this time is how you end up throttling an NVMe controller.
+
+hwmon_by_name() {
+  local want=$1 h name
+  for h in /sys/devices/platform/asustor_it87.*/hwmon/hwmon* /sys/class/hwmon/hwmon*; do
+    [[ -d $h ]] || continue
+    name=$(cat "$h/name" 2>/dev/null) || continue
+    case "$want" in
+      "$name") printf '%s\n' "$h"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+fan_hwmon() {
+  local h
+  for n in it8625 it87 asustor_it87 asustor-it87; do
+    h=$(hwmon_by_name "$n") && { printf '%s\n' "$h"; return 0; }
+  done
+  return 1
+}
+
+# --- temperatures -----------------------------------------------------------
+
+# Prints "temp_millic<TAB>chip<TAB>label" per usable sensor.
+read_temps() {
+  local h name t label v
+  for h in /sys/class/hwmon/hwmon*; do
+    [[ -d $h ]] || continue
+    name=$(cat "$h/name" 2>/dev/null) || continue
+    if [[ $FAN_SOURCES != auto ]]; then
+      local want ok=0
+      for want in $FAN_SOURCES; do [[ $name == "$want" ]] && { ok=1; break; }; done
+      ((ok)) || continue
+    fi
+    for t in "$h"/temp*_input; do
+      [[ -e $t ]] || continue
+      v=$(cat "$t" 2>/dev/null) || continue
+      [[ $v =~ ^-?[0-9]+$ ]] || continue
+      # A disconnected input reports -128000; a sane band excludes it without
+      # this script needing to know which chips are wired on which board.
+      (( v < FAN_TEMP_MIN_C * 1000 || v > FAN_TEMP_MAX_C * 1000 )) && continue
+      label=$(cat "${t%_input}_label" 2>/dev/null) || label=$(basename "${t%_input}")
+      printf '%s\t%s\t%s\n' "$v" "$name" "$label"
+    done
+  done
+}
+
+hottest() {   # -> "millic<TAB>chip<TAB>label", empty when nothing is readable
+  read_temps | sort -rn -k1,1 | head -n 1
+}
+
+# --- the curve --------------------------------------------------------------
+
+pwm_for_temp() {   # tempC -> pwm 0..255, linearly interpolated between points
+  local t=$1 point pt pp
+  local -a temps=() pwms=()
+  for point in $FAN_CURVE; do
+    pt=${point%%:*}; pp=${point##*:}
+    [[ $pt =~ ^-?[0-9]+$ && $pp =~ ^[0-9]+$ ]] || continue
+    temps+=("$pt"); pwms+=("$pp")
+  done
+  local n=${#temps[@]}
+  ((n)) || { printf '%s' "$FAN_FAILSAFE_PWM"; return; }
+
+  (( t <= temps[0] ))     && { printf '%s' "${pwms[0]}"; return; }
+  (( t >= temps[n-1] ))   && { printf '%s' "${pwms[n-1]}"; return; }
+
+  local i
+  for (( i = 1; i < n; i++ )); do
+    if (( t <= temps[i] )); then
+      local t0=${temps[i-1]} t1=${temps[i]} p0=${pwms[i-1]} p1=${pwms[i]}
+      local span=$(( t1 - t0 ))
+      (( span == 0 )) && { printf '%s' "$p1"; return; }
+      # Rounded integer interpolation; no floating point anywhere in a path
+      # that decides how fast a fan spins.
+      printf '%s' "$(( p0 + ( (p1 - p0) * (t - t0) + span / 2 ) / span ))"
+      return
+    fi
+  done
+  printf '%s' "${pwms[n-1]}"
+}
+
+validate_curve() {
+  local point pt pp last=-999 n=0
+  for point in $FAN_CURVE; do
+    [[ $point == *:* ]] || die "FAN_CURVE point is not tempC:pwm -- '$point'"
+    pt=${point%%:*}; pp=${point##*:}
+    [[ $pt =~ ^-?[0-9]+$ ]] || die "FAN_CURVE temperature is not a number -- '$point'"
+    [[ $pp =~ ^[0-9]+$ ]]   || die "FAN_CURVE pwm is not a number -- '$point'"
+    (( pp <= 255 ))         || die "FAN_CURVE pwm above 255 -- '$point'"
+    (( pt > last ))         || die "FAN_CURVE is not ascending at '$point'"
+    last=$pt; n=$((n + 1))
+  done
+  (( n >= 2 )) || die "FAN_CURVE needs at least two points"
+  [[ $FAN_INTERVAL =~ ^[0-9]+$ ]] && (( FAN_INTERVAL > 0 )) || die "FAN_INTERVAL must be a positive number"
+  [[ $FAN_HYSTERESIS =~ ^[0-9]+$ ]] || die "FAN_HYSTERESIS must be a number"
+  [[ $FAN_CRIT_TEMP =~ ^[0-9]+$ ]] || die "FAN_CRIT_TEMP must be a number"
+  [[ $FAN_FAILSAFE_PWM =~ ^[0-9]+$ ]] && (( FAN_FAILSAFE_PWM <= 255 )) || die "FAN_FAILSAFE_PWM must be 0-255"
+}
+
+# --- writing ----------------------------------------------------------------
+
+HW=''
+FAILSAFE_DONE=0
+apply_pwm() {
+  local value=$1
+  local pwm="$HW/pwm$FAN_PWM_CHANNEL"
+  local enable="$HW/pwm${FAN_PWM_CHANNEL}_enable"
+  [[ -e $pwm ]] || return 1
+  # 1 = manual. The chip's own mode 2 would regulate from its disconnected
+  # thermal inputs; see the header. A failing redirection is reported by the
+  # shell before the command runs, so the whole thing has to be wrapped -- not
+  # just the command's own stderr -- or an unprivileged run spews sysfs paths.
+  [[ -e $enable ]] && ( printf '1\n' >"$enable" ) 2>/dev/null
+  ( printf '%s\n' "$value" >"$pwm" ) 2>/dev/null
+}
+
+failsafe() {
+  (( FAILSAFE_DONE )) && return 0
+  FAILSAFE_DONE=1
+  [[ -n $HW ]] || return 0
+  apply_pwm "$FAN_FAILSAFE_PWM" \
+    && log "exiting: fan set to ${FAN_FAILSAFE_PWM}/255 (fail-safe)" \
+    || log "exiting: COULD NOT set the fail-safe fan speed"
+}
+
+# --- modes ------------------------------------------------------------------
+
+if ((opt_failsafe)); then
+  HW=$(fan_hwmon) || die "no IT87-class fan controller found"
+  apply_pwm "$FAN_FAILSAFE_PWM" || die "could not write pwm$FAN_PWM_CHANNEL"
+  log "fan set to ${FAN_FAILSAFE_PWM}/255 (fail-safe)"
+  exit 0
+fi
+
+if ((opt_status)); then
+  HW=$(fan_hwmon) || die "no IT87-class fan controller found"
+  printf 'chip      %s (%s)\n' "$HW" "$(cat "$HW/name")"
+  for f in "$HW"/fan[0-9]_input; do
+    [[ -e $f ]] || continue
+    printf 'fan%-6s %s RPM\n' "${f##*/fan}" "$(cat "$f")"
+  done
+  for p in "$HW"/pwm[0-9]; do
+    [[ -e $p ]] || continue
+    n=${p##*/pwm}
+    printf 'pwm%-6s %-4s (%d%%)  enable=%s\n' "$n" "$(cat "$p")" \
+      "$(( $(cat "$p") * 100 / 255 ))" "$(cat "$HW/pwm${n}_enable" 2>/dev/null || echo '-')"
+  done
+  printf '\nsensors:\n'
+  read_temps | sort -rn -k1,1 | while IFS=$'\t' read -r v chip label; do
+    printf '  %-16s %-16s %d C\n' "$chip" "$label" "$((v / 1000))"
+  done
+  hot=$(hottest)
+  if [[ -n $hot ]]; then
+    IFS=$'\t' read -r v chip label <<<"$hot"
+    printf '\nhottest   %d C (%s %s) -> curve says pwm %s\n' \
+      "$((v / 1000))" "$chip" "$label" "$(pwm_for_temp "$((v / 1000))")"
+  fi
+  exit 0
+fi
+
+validate_curve
+
+if ((opt_check)); then
+  printf 'config    %s%s\n' "$CONF" "$( [[ -r $CONF ]] && printf '' || printf '  (absent, using defaults)')"
+  printf 'curve     %s\n' "$FAN_CURVE"
+  printf 'critical  %s C -> pwm 255\n' "$FAN_CRIT_TEMP"
+  rc=0
+  if HW=$(fan_hwmon); then
+    printf 'chip      %s (%s)\n' "$HW" "$(cat "$HW/name")"
+    if [[ -e $HW/pwm$FAN_PWM_CHANNEL ]]; then
+      printf 'pwm       %s%s\n' "$HW/pwm$FAN_PWM_CHANNEL" \
+        "$( [[ -w $HW/pwm$FAN_PWM_CHANNEL ]] && printf '  (writable)' || printf '  (NOT writable -- needs root)')"
+    else
+      printf 'pwm       %s  NOT PRESENT\n' "$HW/pwm$FAN_PWM_CHANNEL"; rc=1
+    fi
+  else
+    printf 'chip      NOT FOUND\n'; rc=1
+  fi
+  n=$(read_temps | grep -c . || true)
+  printf 'sensors   %s usable\n' "$n"
+  (( n )) || { printf '          %s\n' 'no usable sensor; the daemon would hold the fan at full'; rc=1; }
+  hot=$(hottest)
+  if [[ -n $hot ]]; then
+    IFS=$'\t' read -r v chip label <<<"$hot"
+    printf 'now       %d C (%s %s) -> pwm %s\n' "$((v / 1000))" "$chip" "$label" "$(pwm_for_temp "$((v / 1000))")"
+  fi
+  printf '\ncurve check:\n'
+  for t in 30 40 45 50 55 60 65 70 75 80 85 90; do
+    printf '  %3d C  pwm %3s  (%d%%)\n' "$t" "$(pwm_for_temp "$t")" "$(( $(pwm_for_temp "$t") * 100 / 255 ))"
+  done
+  # The unit runs this as ExecStartPre, so it has to FAIL when the daemon could
+  # not do its job -- not merely say so and exit 0.
+  exit "$rc"
+fi
+
+HW=$(fan_hwmon) || die "no IT87-class fan controller found (is asustor_it87 loaded?)"
+[[ -e $HW/pwm$FAN_PWM_CHANNEL ]] || die "no pwm$FAN_PWM_CHANNEL on $HW"
+if ((opt_dry == 0)) && [[ ! -w $HW/pwm$FAN_PWM_CHANNEL ]]; then
+  die "cannot write $HW/pwm$FAN_PWM_CHANNEL -- run as root, or use --dry-run"
+fi
+
+# Only the long-running daemon arms this. A --once run is asking for the curve
+# to be applied and left alone, and a --dry-run must not write at all.
+#
+# INT and TERM must exit explicitly: a trapped signal whose handler merely
+# returns drops back into the loop, so `systemctl stop` would set the fail-safe
+# and then keep regulating until systemd gave up and sent SIGKILL.
+if ((opt_dry == 0)) && ((opt_once == 0)); then
+  trap 'failsafe; exit 0' INT TERM
+  trap failsafe EXIT
+fi
+
+applied_pwm=-1
+applied_temp=-999
+no_sensor_warned=0
+
+while true; do
+  hot=$(hottest)
+  if [[ -z $hot ]]; then
+    # Blind. Full speed is the only defensible answer.
+    if (( no_sensor_warned == 0 )); then
+      log "no usable temperature sensor; holding the fan at ${FAN_FAILSAFE_PWM}/255"
+      no_sensor_warned=1
+    fi
+    ((opt_dry == 0)) && apply_pwm "$FAN_FAILSAFE_PWM"
+    applied_pwm=$FAN_FAILSAFE_PWM; applied_temp=999
+    ((opt_once)) && break
+    sleep "$FAN_INTERVAL"; continue
+  fi
+  no_sensor_warned=0
+
+  IFS=$'\t' read -r millic chip label <<<"$hot"
+  temp=$(( millic / 1000 ))
+
+  if (( temp >= FAN_CRIT_TEMP )); then
+    target=255
+    reason="CRITICAL ${temp}C >= ${FAN_CRIT_TEMP}C"
+  else
+    target=$(pwm_for_temp "$temp")
+    reason="${temp}C ${chip}/${label}"
+  fi
+
+  # Ramp up the instant it is warranted; only slow down once the temperature
+  # has genuinely fallen. Without this the fan oscillates audibly around every
+  # curve point, which is the single most common complaint about fan daemons.
+  apply=0
+  if (( target > applied_pwm )); then
+    apply=1
+  elif (( target < applied_pwm )) && (( temp <= applied_temp - FAN_HYSTERESIS )); then
+    apply=1
+  elif (( applied_pwm < 0 )); then
+    apply=1
+  fi
+
+  if ((apply)); then
+    if ((opt_dry)); then
+      log "would set pwm${FAN_PWM_CHANNEL}=${target} ($(( target * 100 / 255 ))%) -- ${reason}"
+    else
+      if apply_pwm "$target"; then
+        log "pwm${FAN_PWM_CHANNEL}=${target} ($(( target * 100 / 255 ))%) -- ${reason}"
+      else
+        log "FAILED to write pwm${FAN_PWM_CHANNEL}; retrying next cycle"
+      fi
+    fi
+    applied_pwm=$target
+    applied_temp=$temp
+  elif (( temp > applied_temp )); then
+    # Track the peak so hysteresis measures the fall from it, not from the
+    # temperature that happened to be current when the level was last changed.
+    applied_temp=$temp
+  fi
+
+  ((opt_once)) && break
+  sleep "$FAN_INTERVAL"
+done

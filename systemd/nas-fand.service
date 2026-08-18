@@ -1,0 +1,39 @@
+[Unit]
+Description=Temperature-driven fan control for ASUSTOR NAS hardware
+Documentation=file:///usr/local/share/doc/asustor-nas-control/thermal-and-lcd.md
+After=multi-user.target
+# No IT87 fan controller, no reason to run.
+ConditionPathExistsGlob=/sys/devices/platform/asustor_it87.*
+
+[Service]
+Type=simple
+# Refuse to start on a configuration that would misdrive a fan, rather than
+# starting and finding out at 85 C.
+ExecStartPre=/usr/local/bin/nas-fand --check
+ExecStart=/usr/local/bin/nas-fand
+
+# The daemon traps its own exit and drives the fan to full. A SIGKILL never
+# reaches that trap, so systemd repeats it from the outside. Both paths are
+# deliberate: a fan daemon that is not running must leave a NAS loud, because
+# silence is the failure you discover when a disk has already died.
+ExecStopPost=/usr/local/bin/nas-fand --failsafe
+
+Restart=always
+RestartSec=5
+
+# Writes to /sys, so ProtectKernelTunables and ProtectSystem=strict are both
+# out -- they would make the one file this daemon exists to write read-only.
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

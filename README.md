@@ -35,6 +35,8 @@ After installing, these commands should be available from any directory:
 asustorctl status
 fanspeed 200
 nas-status
+nas-fand --status
+nas-lcd-banner --check
 cloud-nas-status
 cloud-nas-sync-now
 cloud-nas-watch
@@ -213,6 +215,57 @@ mountpoint is an empty directory.
 Full documentation, including the job registry format and configuration:
 [`docs/nas-status.md`](docs/nas-status.md).
 
+## Fan Control and the Front LCD
+
+Two things this board does not do for itself on Linux. `scripts/install.sh`
+installs **and enables** both.
+
+**Fan.** The board ships in manual mode pinned at `pwm1=51` — 20 %, 770 RPM —
+and never ramps whatever the temperature, so the package idles at 73–80 °C. It
+cannot simply be handed to the chip's own automatic mode: the IT8625's thermal
+inputs are not connected and read −128 °C, so `pwm1_enable=2` would regulate
+against a sensor that does not exist. `nas-fand` keeps the chip in manual mode
+and drives the curve from sensors that are real — `coretemp`, the NVMe
+controllers, the NICs — hottest reading wins.
+
+```bash
+nas-fand --status     # temperatures, PWM, RPM. Read-only, no root.
+nas-fand --check      # validate the config; print the curve as a table
+nas-fand --dry-run    # decide against the real temperatures, write nothing
+```
+
+```text
+FAN_CURVE="50:60 60:120 70:200 78:255"     # /etc/nas-fan/nas-fan.conf
+   50 C  pwm  60  (23%)      70 C  pwm 200  (78%)
+   60 C  pwm 120  (47%)      78 C  pwm 255  (100%)
+```
+
+**Stopping the service spins the fan up, on purpose.** Every exit path — clean
+stop, crash, `SIGKILL`, a config that fails validation — drives the fan to full.
+A fan daemon that is not running must leave a NAS loud, not silent; silence is
+the failure you find out about when a disk has already died.
+
+**LCD.** `lcd-banner.service` writes the machine's identity to the front panel
+once the boot has finished:
+
+```text
+  ArchNAS
+  192.168.0.212
+```
+
+Bottom row defaults to the address you would SSH to, or `DEGRADED n fail` when
+systemd reports the boot as degraded. A udev rule matched on the port's hardware
+address (`0x2F8`, not the node name — 32 `ttyS` nodes exist and three are real)
+creates `/dev/asustor-lcm` and grants a system group `lcm` write access.
+
+```bash
+nas-lcd-banner --check          # what would be written, touching no hardware
+lcdline --dry-run 0 ArchNAS     # the raw frame, checksum and all
+```
+
+Full details, protocol, tuning and recovery:
+[`docs/thermal-and-lcd.md`](docs/thermal-and-lcd.md).
+
 ## Cloud NAS Commands
 
 These commands are convenience wrappers for the rclone NAS automation that
@@ -381,6 +434,7 @@ Check which copy is being run:
 command -v asustorctl
 command -v fanspeed
 command -v nas-status
+command -v nas-fand
 command -v cloud-nas-status
 command -v cloud-nas-sync-now
 command -v cloud-nas-watch
@@ -393,6 +447,7 @@ They should normally be:
 /usr/local/bin/asustorctl
 /usr/local/bin/fanspeed
 /usr/local/bin/nas-status
+/usr/local/bin/nas-fand
 /usr/local/bin/cloud-nas-status
 /usr/local/bin/cloud-nas-sync-now
 /usr/local/bin/cloud-nas-watch

@@ -19,6 +19,9 @@ install -Dm755 scripts/cloud-nas-watch /usr/local/bin/cloud-nas-watch
 install -Dm755 scripts/cloud-nas-progress /usr/local/bin/cloud-nas-progress
 install -Dm755 scripts/nas-mount-migrate /usr/local/bin/nas-mount-migrate
 install -Dm755 scripts/nas-status /usr/local/bin/nas-status
+install -Dm755 scripts/nas-fand /usr/local/bin/nas-fand
+install -Dm755 scripts/lcdline /usr/local/bin/lcdline
+install -Dm755 scripts/nas-lcd-banner /usr/local/bin/nas-lcd-banner
 install -Dm755 scripts/m365-backup-lib /usr/local/bin/m365-backup-lib
 install -Dm755 scripts/m365-backup-preflight /usr/local/bin/m365-backup-preflight
 install -Dm755 scripts/m365-backup-inventory /usr/local/bin/m365-backup-inventory
@@ -26,6 +29,7 @@ install -Dm755 scripts/m365-backup-sync /usr/local/bin/m365-backup-sync
 install -Dm755 scripts/m365-backup-status /usr/local/bin/m365-backup-status
 install -Dm644 docs/m365-backup.md /usr/local/share/doc/asustor-nas-control/m365-backup.md
 install -Dm644 docs/nas-status.md /usr/local/share/doc/asustor-nas-control/nas-status.md
+install -Dm644 docs/thermal-and-lcd.md /usr/local/share/doc/asustor-nas-control/thermal-and-lcd.md
 install -Dm644 systemd/m365-backup.service /etc/systemd/system/m365-backup.service
 install -Dm644 systemd/m365-backup.timer /etc/systemd/system/m365-backup.timer
 
@@ -46,6 +50,9 @@ printf '  /usr/local/bin/cloud-nas-watch\n'
 printf '  /usr/local/bin/cloud-nas-progress\n'
 printf '  /usr/local/bin/nas-mount-migrate\n'
 printf '  /usr/local/bin/nas-status\n'
+printf '  /usr/local/bin/nas-fand\n'
+printf '  /usr/local/bin/lcdline\n'
+printf '  /usr/local/bin/nas-lcd-banner\n'
 printf '  /usr/local/bin/m365-backup-lib\n'
 printf '  /usr/local/bin/m365-backup-preflight\n'
 printf '  /usr/local/bin/m365-backup-inventory\n'
@@ -102,6 +109,72 @@ if [[ -n $target_user ]]; then
   fi
 else
   printf '  (SUDO_USER unset -- skipped the user-level tenant sync loop)\n'
+fi
+
+# ---------------------------------------------------------------------------
+# Fan control and the front LCD
+# ---------------------------------------------------------------------------
+#
+# Both are enabled here rather than merely installed. They exist because the
+# board ships with no fan curve at all -- manual mode pinned at 20%, with the
+# CPU sitting at 80 C -- and a NAS that boots without fan control is the
+# problem this is meant to fix, not a state to leave someone to opt into.
+
+install -Dm644 systemd/nas-fand.service /etc/systemd/system/nas-fand.service
+install -Dm644 systemd/lcd-banner.service /etc/systemd/system/lcd-banner.service
+install -Dm644 systemd/udev/99-asustor-lcm.rules /etc/udev/rules.d/99-asustor-lcm.rules
+
+for conf_pair in "nas-fan:nas-fan.conf" "nas-lcd:nas-lcd.conf"; do
+  conf_dir=/etc/${conf_pair%%:*}
+  conf_file=$conf_dir/${conf_pair##*:}
+  if [[ ! -e $conf_file ]]; then
+    install -d -m 0755 "$conf_dir"
+    install -m 0644 "scripts/${conf_pair##*:}.example" "$conf_file"
+    printf '  %s  (seeded from the example)\n' "$conf_file"
+  else
+    printf '  %s already exists and was left untouched\n' "$conf_file"
+  fi
+done
+
+# A system group, not uucp: uucp would hand over every serial device on the
+# machine, including COM1 and any USB serial adapter plugged in later.
+if ! getent group lcm >/dev/null; then
+  groupadd -r lcm
+  printf '  group lcm  (created)\n'
+fi
+if [[ -n ${SUDO_USER:-} ]] && ! id -nG "$SUDO_USER" | tr ' ' '\n' | grep -qx lcm; then
+  # -a is not optional: without it this replaces every other group the user is
+  # in, wheel included, and takes their sudo with it.
+  usermod -aG lcm "$SUDO_USER"
+  printf '  %s added to group lcm  (log in again, or run: newgrp lcm)\n' "$SUDO_USER"
+fi
+
+udevadm control --reload-rules 2>/dev/null || true
+udevadm trigger --subsystem-match=tty --action=add 2>/dev/null || true
+
+systemctl daemon-reload 2>/dev/null || true
+
+printf '\nFan control:\n'
+if /usr/local/bin/nas-fand --check >/dev/null 2>&1; then
+  systemctl enable --now nas-fand.service 2>/dev/null \
+    && printf '  nas-fand.service enabled and started\n' \
+    || printf '  could not start nas-fand.service -- systemctl status nas-fand\n'
+  sleep 1
+  /usr/local/bin/nas-fand --status 2>/dev/null | sed -n '1,4p;/^hottest/p' | sed 's/^/  /'
+else
+  printf '  nas-fand --check FAILED; not enabling. Run it by hand to see why:\n'
+  /usr/local/bin/nas-fand --check 2>&1 | sed 's/^/    /' || true
+fi
+printf '  stopping this service drives the fan to FULL on purpose; see the header of nas-fand\n'
+
+printf '\nFront LCD:\n'
+if [[ -e /dev/ttyS1 ]]; then
+  systemctl enable --now lcd-banner.service 2>/dev/null \
+    && printf '  lcd-banner.service enabled and started\n' \
+    || printf '  could not start lcd-banner.service -- systemctl status lcd-banner\n'
+  /usr/local/bin/nas-lcd-banner --check 2>/dev/null | sed -n '1,4p' | sed 's/^/  /'
+else
+  printf '  /dev/ttyS1 is absent; skipped\n'
 fi
 
 printf '\nMicrosoft 365 mirror (read docs/m365-backup.md first):\n'

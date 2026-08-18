@@ -109,6 +109,13 @@ SNAPSHOT_RESERVE_GIB="${NAS_STATUS_RESERVE_GIB:-10}"
 
 TMUX_SESSION="${NAS_STATUS_TMUX_SESSION:-rclone-sync}"
 
+# Thermal. This board ships with no fan curve -- manual mode pinned at 20%,
+# with the CPU at 80 C -- so "is it cooking" belongs on the health screen next
+# to "is it mounted".
+TEMP_WARN_C="${NAS_STATUS_TEMP_WARN_C:-78}"
+TEMP_CRIT_C="${NAS_STATUS_TEMP_CRIT_C:-85}"
+FAND_UNIT="${NAS_STATUS_FAND_UNIT:-nas-fand.service}"
+
 declare -p NAS_JOBS >/dev/null 2>&1 || nas_default_jobs
 # Adding one job should not mean restating the built-in five.
 if declare -p NAS_STATUS_EXTRA_JOBS >/dev/null 2>&1; then
@@ -1072,6 +1079,106 @@ snapshot_epoch() {   # 202608190330_NAS_03_backup -> epoch
 }
 
 # ---------------------------------------------------------------------------
+# Thermal
+# ---------------------------------------------------------------------------
+
+declare -A THERM=()
+
+probe_thermal() {
+  THERM[chip]=''; THERM[pwm]=''; THERM[pwm_enable]=''; THERM[rpm]=''
+  THERM[hot_c]=''; THERM[hot_src]=''; THERM[fand_active]=''; THERM[fand_load]=''
+
+  local h name
+  for h in /sys/devices/platform/asustor_it87.*/hwmon/hwmon* /sys/class/hwmon/hwmon*; do
+    [[ -d $h ]] || continue
+    name=$(cat "$h/name" 2>/dev/null) || continue
+    case "$name" in
+      it8625|it87|asustor_it87|asustor-it87) THERM[chip]=$h; break ;;
+    esac
+  done
+
+  if [[ -n ${THERM[chip]} ]]; then
+    THERM[pwm]=$(cat "${THERM[chip]}/pwm1" 2>/dev/null)
+    THERM[pwm_enable]=$(cat "${THERM[chip]}/pwm1_enable" 2>/dev/null)
+    THERM[rpm]=$(cat "${THERM[chip]}/fan1_input" 2>/dev/null)
+  fi
+
+  # Hottest sane reading, whatever it belongs to. The band is what excludes
+  # this board's disconnected IT8625 inputs, which report -128 C.
+  local t v label best='' best_src=''
+  for h in /sys/class/hwmon/hwmon*; do
+    [[ -d $h ]] || continue
+    name=$(cat "$h/name" 2>/dev/null) || continue
+    for t in "$h"/temp*_input; do
+      [[ -e $t ]] || continue
+      v=$(cat "$t" 2>/dev/null) || continue
+      [[ $v =~ ^-?[0-9]+$ ]] || continue
+      ((v < 0 || v > 150000)) && continue
+      if [[ -z $best ]] || ((v > best)); then
+        label=$(cat "${t%_input}_label" 2>/dev/null) || label=''
+        best=$v; best_src="$name${label:+/$label}"
+      fi
+    done
+  done
+  if [[ -n $best ]]; then
+    THERM[hot_c]=$((best / 1000))
+    THERM[hot_src]=$best_src
+  fi
+
+  probe_unit system "$FAND_UNIT"
+  THERM[fand_load]=$U_LOAD
+  THERM[fand_active]=$U_ACTIVE
+  THERM[fand_enabled]=$U_ENABLED
+
+  if [[ ${THERM[hot_c]} =~ ^[0-9]+$ ]]; then
+    if ((THERM[hot_c] >= TEMP_CRIT_C)); then worst_at_least 2
+    elif ((THERM[hot_c] >= TEMP_WARN_C)); then worst_at_least 1
+    fi
+  fi
+  # A fan controller that is installed and not running is the state that put
+  # this box at 80 C in the first place.
+  if [[ ${THERM[fand_load]} == loaded && ${THERM[fand_active]} != active ]]; then
+    worst_at_least 1
+  fi
+  return 0
+}
+
+render_thermal() {
+  [[ -n ${THERM[chip]} || -n ${THERM[hot_c]} ]] || return 0
+  section 'THERMAL'
+  local color=$C_GREEN
+  if [[ ${THERM[hot_c]} =~ ^[0-9]+$ ]]; then
+    ((THERM[hot_c] >= TEMP_WARN_C)) && color=$C_YELLOW
+    ((THERM[hot_c] >= TEMP_CRIT_C)) && color=$C_RED
+    printf '  %-9s %s%s C%s  (%s)\n' 'hottest' "$color" "${THERM[hot_c]}" "$C_RESET" "${THERM[hot_src]}"
+  else
+    printf '  %-9s %sno usable sensor%s\n' 'hottest' "$C_RED" "$C_RESET"
+  fi
+  if [[ ${THERM[pwm]} =~ ^[0-9]+$ ]]; then
+    local mode
+    case "${THERM[pwm_enable]}" in
+      0) mode='full-on' ;; 1) mode='manual' ;; 2) mode='chip auto' ;; *) mode="enable=${THERM[pwm_enable]:--}" ;;
+    esac
+    printf '  %-9s pwm1=%s (%d%%)  %s RPM  %s\n' 'fan' "${THERM[pwm]}" \
+      $((THERM[pwm] * 100 / 255)) "${THERM[rpm]:--}" "$mode"
+  fi
+  case "${THERM[fand_load]}" in
+    loaded)
+      if [[ ${THERM[fand_active]} == active ]]; then
+        printf '  %-9s %s  active  %s\n' 'control' "$FAND_UNIT" "${THERM[fand_enabled]}"
+      else
+        printf '  %-9s %s%s is %s -- nothing is regulating this fan%s\n' \
+          'control' "$C_YELLOW" "$FAND_UNIT" "${THERM[fand_active]}" "$C_RESET"
+      fi
+      ;;
+    *)
+      printf '  %-9s %sno fan daemon installed; the chip holds whatever PWM it was last given%s\n' \
+        'control' "$C_DIM" "$C_RESET"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
 # Remotes nobody told us about
 # ---------------------------------------------------------------------------
 #
@@ -1603,6 +1710,13 @@ render_json() {
     --argjson jobs "$jobs_json" \
     --argjson other_units "$extra_json" \
     --argjson remotes "$remotes_json" \
+    --arg therm_src "${THERM[hot_src]}" \
+    --arg therm_fand "${THERM[fand_active]}" \
+    --arg therm_fand_load "${THERM[fand_load]}" \
+    --argjson therm_c "$(jnum "${THERM[hot_c]}")" \
+    --argjson therm_pwm "$(jnum "${THERM[pwm]}")" \
+    --argjson therm_enable "$(jnum "${THERM[pwm_enable]}")" \
+    --argjson therm_rpm "$(jnum "${THERM[rpm]}")" \
     --arg snap_root "${SNAP[root]}" \
     --arg snap_state "${SNAP[state]}" \
     --arg snap_oldest "${SNAP[oldest]}" \
@@ -1622,6 +1736,9 @@ render_json() {
                   available: $snap_avail, reserve: $snap_reserve,
                   incomplete: ($snap_incomplete | split(" ") | map(select(length > 0)))},
       remotes: $remotes,
+      thermal: {hottest_c: $therm_c, hottest_source: $therm_src,
+                pwm: $therm_pwm, pwm_enable: $therm_enable, fan_rpm: $therm_rpm,
+                fan_daemon: {load: $therm_fand_load, active: $therm_fand}},
       other_units: $other_units}'
 }
 
@@ -1633,11 +1750,12 @@ collect() {
   now_epoch=$(date +%s)
   VOL=(); VOL_ORDER=()
   JOB=(); JOB_ORDER=()
-  SNAP=(); EXTRA_UNITS=(); REMOTES=()
+  SNAP=(); EXTRA_UNITS=(); REMOTES=(); THERM=()
   WORST=0
   probe_volumes
   probe_jobs
   probe_snapshots
+  probe_thermal
   probe_remotes
   probe_extra_units
 }
@@ -1651,6 +1769,7 @@ render_text() {
     for id in "${JOB_ORDER[@]}"; do render_job_detail "$id"; done
   fi
   render_snapshots
+  render_thermal
   render_remotes
   render_extra_units
   render_footer

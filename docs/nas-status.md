@@ -79,6 +79,11 @@ instantly is minutes of disk for nothing.
 oldest and newest, the size of the newest, any `.incomplete` leftovers, and
 whether free space has dropped below the reserve the backup loop prunes to.
 
+**Thermal.** The hottest sane sensor reading, the fan's PWM and RPM, and
+whether anything is actually regulating it. Exit 1 at 78 °C, exit 2 at 85 °C,
+and exit 1 if `nas-fand` is installed but not running — the state that had this
+box idling at 80 °C. See [`thermal-and-lcd.md`](thermal-and-lcd.md).
+
 **Rclone remotes.** Every remote `rclone config` knows about, and which job
 mirrors it. A remote somebody added and never wired to a job looks like it is
 being backed up and is not, so it is called out — as is a remote whose registry

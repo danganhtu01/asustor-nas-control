@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+#
+# lcdline -- write one 16-character line to the ASUSTOR AS6704T front LCD.
+#
+# Panel protocol, verified against mafredri/lcm (message.go), phjz/AS6704T
+# (lcm.js), the tangrs Lockerstor Gen2 write-up, and ASUSTOR's own captured
+# lcmd serial traffic:
+#
+#   frame = TYPE LEN FUNC [DATA...] CSUM
+#     TYPE  0xF0 command (host->panel, and panel->host for buttons)
+#           0xF1 reply
+#     LEN   counts DATA only, so a frame is 3 + LEN + 1 bytes
+#     CSUM  plain 8-bit sum of every preceding byte
+#
+#   set text = FUNC 0x27, LEN 0x12 (18 = line + indent + 16 chars):
+#     F0 12 27 <line> <indent> <16 ASCII, space-padded> <csum>
+#
+# The panel replies F1 01 27 00 19 on success and F1 01 27 04 1D on error, and
+# ASUSTOR's own daemon simply re-sends on any non-zero status. This script does
+# not read replies -- binary reads in bash are more fragile than the problem
+# deserves -- so --retry re-sends unconditionally instead, which is what the
+# boot banner uses. If this ever runs on every sync cycle rather than once at
+# boot, it should become a client of a daemon that does read them.
+
+set -euo pipefail
+
+PORT="${LCD_PORT:-/dev/ttyS1}"
+RETRY=1
+DRYRUN=${LCD_DRYRUN:-0}
+INDENT=0
+
+usage() {
+  cat <<'USAGE'
+Usage: lcdline [options] <0|1> [text...]
+
+Write one line to the ASUSTOR front LCD. Line 0 is the top row, 1 the bottom.
+Text is truncated to 16 characters and padded with spaces; an empty text
+clears the line.
+
+Options:
+  -p, --port DEV     Serial device (default /dev/ttyS1, or $LCD_PORT)
+  -r, --retry N      Send the frame N times (default 1). The panel NAKs during
+                     early boot, and this script cannot read the NAK.
+  -i, --indent N     Panel-side indent, 0-15. Prefer padding the text instead:
+                     with a non-zero indent not all characters stay visible.
+  -n, --dry-run      Print the hex frame instead of writing it ($LCD_DRYRUN=1)
+  -h, --help         This text
+USAGE
+}
+
+while (($#)); do
+  case "$1" in
+    -p|--port)   shift; PORT=${1:?--port needs a device} ;;
+    -r|--retry)  shift; [[ ${1:-} =~ ^[0-9]+$ ]] && (( $1 > 0 )) || {
+                   printf 'lcdline: --retry needs a positive number\n' >&2; exit 2; }
+                 RETRY=$1 ;;
+    -i|--indent) shift; [[ ${1:-} =~ ^[0-9]+$ ]] && (( $1 <= 15 )) || {
+                   printf 'lcdline: --indent must be 0-15\n' >&2; exit 2; }
+                 INDENT=$1 ;;
+    -n|--dry-run) DRYRUN=1 ;;
+    -h|--help)   usage; exit 0 ;;
+    --)          shift; break ;;
+    -*)          printf 'lcdline: unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    *)           break ;;
+  esac
+  shift
+done
+
+[[ $# -ge 1 ]] || { usage >&2; exit 2; }
+[[ ${1} =~ ^[01]$ ]] || { printf 'lcdline: line must be 0 or 1\n' >&2; exit 2; }
+line=$1; shift
+text="$*"
+
+# Printable ASCII only. Above 0x7F the panel uses a custom HD44780-style CGROM,
+# not ASCII, so a stray byte prints as an unrelated glyph rather than failing.
+text=$(printf '%s' "$text" | tr -c '\40-\176' '?')
+text="${text:0:16}"
+printf -v text '%-16s' "$text"
+
+sum=$(( 0xF0 + 0x12 + 0x27 + line + INDENT ))
+for (( i = 0; i < 16; i++ )); do
+  printf -v ord '%d' "'${text:i:1}"
+  sum=$(( sum + (ord & 0xFF) ))
+done
+cs=$(( sum & 0xFF ))
+
+emit() {
+  printf '\xF0\x12\x27'
+  printf "\\$(printf '%03o' "$line")"
+  printf "\\$(printf '%03o' "$INDENT")"
+  printf '%s' "$text"
+  printf "\\$(printf '%03o' "$cs")"
+}
+
+if [[ $DRYRUN == 1 ]]; then
+  emit | od -An -tx1 -v | tr -s ' '
+  exit 0
+fi
+
+[[ -w $PORT ]] || {
+  printf 'lcdline: cannot write %s\n' "$PORT" >&2
+  printf '  the port is root:uucp 0660; install the udev rule and join the lcm group\n' >&2
+  exit 1
+}
+
+stty -F "$PORT" 115200 raw -echo -echoe -echok -crtscts min 0 time 1 2>/dev/null || true
+
+# The panel sends unsolicited button frames (F0 01 80 <1-4> <csum>) at any
+# time. Nothing here reads them, so drain whatever has accumulated rather than
+# leaving the receive buffer to fill.
+dd if="$PORT" of=/dev/null bs=256 count=4 iflag=nonblock 2>/dev/null || true
+
+for (( n = 0; n < RETRY; n++ )); do
+  emit > "$PORT"
+  (( n + 1 < RETRY )) && sleep 0.05
+done

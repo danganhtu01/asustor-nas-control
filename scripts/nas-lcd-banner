@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+#
+# nas-lcd-banner -- put the machine's identity on the ASUSTOR front LCD.
+#
+# Run once at the end of boot by lcd-banner.service. Line 0 is the name; line 1
+# defaults to whatever is most worth knowing from across the room: the address
+# you would SSH to, or -- if systemd says the boot was not clean -- how many
+# units failed. A front panel that can say "degraded" is most of the reason to
+# have a front panel on a headless box.
+
+set -uo pipefail
+
+CONF="${NAS_LCD_CONF:-/etc/nas-lcd/nas-lcd.conf}"
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && . "$CONF"
+
+LCD_PORT="${LCD_PORT:-/dev/ttyS1}"
+LCD_LINE0="${LCD_LINE0:-$(uname -n)}"
+LCD_LINE1="${LCD_LINE1:-auto}"
+LCD_RETRY="${LCD_RETRY:-3}"
+LCD_SETTLE="${LCD_SETTLE:-0}"
+
+lcdline_bin=${LCDLINE:-}
+if [[ -z $lcdline_bin ]]; then
+  for c in "$(dirname -- "$(readlink -f -- "$0")")/lcdline" /usr/local/bin/lcdline; do
+    [[ -x $c ]] && { lcdline_bin=$c; break; }
+  done
+fi
+
+usage() {
+  cat <<'USAGE'
+Usage: nas-lcd-banner [options]
+
+Write the standing banner to the ASUSTOR front LCD.
+
+Options:
+  -0, --line0 TEXT   Top row (default: hostname, or $LCD_LINE0)
+  -1, --line1 TEXT   Bottom row (default: "auto" -- boot health, else the IP)
+      --off          Blank both rows and switch the display off
+      --check        Print what would be written, touching no hardware
+  -h, --help         This text
+
+Configuration: /etc/nas-lcd/nas-lcd.conf (LCD_PORT, LCD_LINE0, LCD_LINE1,
+LCD_RETRY, LCD_SETTLE). Set LCD_LINE1='' for a blank bottom row.
+USAGE
+}
+
+opt_off=0
+opt_check=0
+while (($#)); do
+  case "$1" in
+    -0|--line0) shift; LCD_LINE0=${1-} ;;
+    -1|--line1) shift; LCD_LINE1=${1-} ;;
+    --off)      opt_off=1 ;;
+    --check)    opt_check=1 ;;
+    -h|--help)  usage; exit 0 ;;
+    *) printf 'nas-lcd-banner: unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# The address someone would actually reach this box on: the source address the
+# kernel picks for off-link traffic. That is the routable one, and it does not
+# require guessing an interface name.
+primary_ip() {
+  local ip
+  ip=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n 1)
+  [[ -n $ip ]] || ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  printf '%s' "${ip:-no address}"
+}
+
+boot_line() {
+  local state failed
+  state=$(systemctl is-system-running 2>/dev/null || true)
+  case "$state" in
+    running)  primary_ip ;;
+    degraded)
+      failed=$(systemctl list-units --state=failed --no-legend --plain 2>/dev/null | grep -c .)
+      printf 'DEGRADED %s fail' "${failed:-?}"
+      ;;
+    starting|'') primary_ip ;;
+    *)        printf '%s' "$state" ;;
+  esac
+}
+
+line1=$LCD_LINE1
+[[ $line1 == auto ]] && line1=$(boot_line)
+
+if ((opt_check)); then
+  printf 'port   %s%s\n' "$LCD_PORT" "$( [[ -w $LCD_PORT ]] && printf ' (writable)' || printf ' (NOT writable)')"
+  printf 'helper %s\n' "${lcdline_bin:-NOT FOUND}"
+  printf 'line 0 [%-16.16s]\n' "$LCD_LINE0"
+  printf 'line 1 [%-16.16s]\n' "$line1"
+  [[ -n $lcdline_bin ]] && {
+    printf 'frame0%s\n' "$(LCD_DRYRUN=1 "$lcdline_bin" 0 "$LCD_LINE0")"
+    printf 'frame1%s\n' "$(LCD_DRYRUN=1 "$lcdline_bin" 1 "$line1")"
+  }
+  exit 0
+fi
+
+[[ -n $lcdline_bin ]] || { printf 'nas-lcd-banner: no lcdline helper found\n' >&2; exit 1; }
+[[ -w $LCD_PORT ]] || { printf 'nas-lcd-banner: cannot write %s\n' "$LCD_PORT" >&2; exit 1; }
+
+# The panel runs a fixed ~6s animation after power-on and NAKs everything sent
+# during it (lcm power.go: lcmPowerOnSettleTime). The unit waits; a hand-run
+# does not need to.
+(( LCD_SETTLE > 0 )) && sleep "$LCD_SETTLE"
+
+stty -F "$LCD_PORT" 115200 raw -echo 2>/dev/null || true
+
+if ((opt_off)); then
+  "$lcdline_bin" --port "$LCD_PORT" --retry "$LCD_RETRY" 0 ''
+  "$lcdline_bin" --port "$LCD_PORT" --retry "$LCD_RETRY" 1 ''
+  printf '\xf0\x01\x11\x00\x02' > "$LCD_PORT"    # DisplayOff
+  exit 0
+fi
+
+printf '\xf0\x01\x11\x01\x03' > "$LCD_PORT"      # DisplayOn
+sleep 0.05
+"$lcdline_bin" --port "$LCD_PORT" --retry "$LCD_RETRY" 0 "$LCD_LINE0"
+"$lcdline_bin" --port "$LCD_PORT" --retry "$LCD_RETRY" 1 "$line1"
