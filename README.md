@@ -34,6 +34,7 @@ After installing, these commands should be available from any directory:
 ```bash
 asustorctl status
 fanspeed 200
+nas-status
 cloud-nas-status
 cloud-nas-sync-now
 cloud-nas-watch
@@ -54,6 +55,7 @@ For a local user-only test without installing:
 ```bash
 ./scripts/asustorctl status
 ./scripts/fanspeed 200
+./scripts/nas-status
 ./scripts/cloud-nas-status
 ./scripts/cloud-nas-watch --no-follow
 ./scripts/cloud-nas-progress --once
@@ -156,6 +158,60 @@ Set blink slot 1 frequency mode to always-on when supported:
 ```bash
 asustorctl blink freq 1 11
 ```
+
+## NAS Status
+
+One screen of truth for the whole box — every rclone sync job and backup job,
+what each one last did, when it runs next, how big each destination has grown,
+and whether every volume is still mounted.
+
+```bash
+nas-status
+```
+
+```text
+== VOLUMES ==
+VOLUME    STATE         DEVICE                SIZE       USED       FREE  USE%  MOUNTPOINT
+NAS_02    mounted       /dev/nvme0n1p1      1.8TiB   738.8GiB  1000.8GiB   43%  /srv/NAS_02
+NAS_03    mounted       /dev/nvme1n1p1      1.8TiB   722.5GiB  1017.1GiB   42%  /srv/NAS_03
+
+== JOBS ==
+JOB                   STATE          LAST      LAST RUN             NEXT RUN
+onedrive-personal     RUNNING        failed    16:29:07  31m ago    after this cycle
+onedrive-da           IDLE           ok        16:40:49  19m ago    17:40  in 40m
+nas03-backup          IDLE           ok        15:30:13  1h30m ago  03:30  in 10h29m
+```
+
+`STATE` and `LAST` answer two different questions on purpose — whether the job
+is alive right now, and whether its last completed cycle worked. A job can be
+`RUNNING` and `failed` at the same time, mid-retry after a bad cycle.
+
+It also lists every rclone remote and which job mirrors it, the snapshot set on
+NAS_02, and any NAS-ish systemd unit on the box the registry does not name — so
+a remote or a job somebody added is never quietly omitted.
+
+Running it inside zellij also opens a pane named `nas-btop` running `btop`, and
+gives focus straight back. That is idempotent: a `nas-btop` pane that already
+exists is left alone, so running `nas-status` in a loop never stacks monitors.
+
+Common variants:
+
+```bash
+nas-status --brief          # the summary tables only
+nas-status --watch          # redraw every 30 seconds
+nas-status --fast           # cached destination sizes; never walk a tree
+nas-status --refresh        # re-measure every destination now
+nas-status --job onedrive-da
+nas-status --json | jq '.jobs[] | select(.result == "failed")'
+nas-status --no-btop        # never touch zellij
+```
+
+Exit status is meant for monitors: `0` healthy, `1` degraded, `2` critical — a
+volume is not mounted, or a job is writing to the OS disk because its
+mountpoint is an empty directory.
+
+Full documentation, including the job registry format and configuration:
+[`docs/nas-status.md`](docs/nas-status.md).
 
 ## Cloud NAS Commands
 
@@ -324,6 +380,7 @@ Check which copy is being run:
 ```bash
 command -v asustorctl
 command -v fanspeed
+command -v nas-status
 command -v cloud-nas-status
 command -v cloud-nas-sync-now
 command -v cloud-nas-watch
@@ -335,6 +392,7 @@ They should normally be:
 ```text
 /usr/local/bin/asustorctl
 /usr/local/bin/fanspeed
+/usr/local/bin/nas-status
 /usr/local/bin/cloud-nas-status
 /usr/local/bin/cloud-nas-sync-now
 /usr/local/bin/cloud-nas-watch
@@ -347,6 +405,7 @@ Verify the installed scripts match the repo:
 cd ~/GitHub/asustor-nas-control
 cmp -s scripts/asustorctl /usr/local/bin/asustorctl && echo asustorctl-ok || echo reinstall-asustorctl
 cmp -s scripts/fanspeed /usr/local/bin/fanspeed && echo fanspeed-ok || echo reinstall-fanspeed
+cmp -s scripts/nas-status /usr/local/bin/nas-status && echo nas-status-ok || echo reinstall-nas-status
 cmp -s scripts/cloud-nas-status /usr/local/bin/cloud-nas-status && echo cloud-nas-status-ok || echo reinstall-cloud-nas-status
 cmp -s scripts/cloud-nas-sync-now /usr/local/bin/cloud-nas-sync-now && echo cloud-nas-sync-now-ok || echo reinstall-cloud-nas-sync-now
 cmp -s scripts/cloud-nas-watch /usr/local/bin/cloud-nas-watch && echo cloud-nas-watch-ok || echo reinstall-cloud-nas-watch

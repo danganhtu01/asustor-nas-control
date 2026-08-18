@@ -14,12 +14,14 @@ install -Dm755 scripts/cloud-nas-sync-now /usr/local/bin/cloud-nas-sync-now
 install -Dm755 scripts/cloud-nas-watch /usr/local/bin/cloud-nas-watch
 install -Dm755 scripts/cloud-nas-progress /usr/local/bin/cloud-nas-progress
 install -Dm755 scripts/nas-mount-migrate /usr/local/bin/nas-mount-migrate
+install -Dm755 scripts/nas-status /usr/local/bin/nas-status
 install -Dm755 scripts/m365-backup-lib /usr/local/bin/m365-backup-lib
 install -Dm755 scripts/m365-backup-preflight /usr/local/bin/m365-backup-preflight
 install -Dm755 scripts/m365-backup-inventory /usr/local/bin/m365-backup-inventory
 install -Dm755 scripts/m365-backup-sync /usr/local/bin/m365-backup-sync
 install -Dm755 scripts/m365-backup-status /usr/local/bin/m365-backup-status
 install -Dm644 docs/m365-backup.md /usr/local/share/doc/asustor-nas-control/m365-backup.md
+install -Dm644 docs/nas-status.md /usr/local/share/doc/asustor-nas-control/nas-status.md
 install -Dm644 systemd/m365-backup.service /etc/systemd/system/m365-backup.service
 install -Dm644 systemd/m365-backup.timer /etc/systemd/system/m365-backup.timer
 
@@ -39,6 +41,7 @@ printf '  /usr/local/bin/cloud-nas-sync-now\n'
 printf '  /usr/local/bin/cloud-nas-watch\n'
 printf '  /usr/local/bin/cloud-nas-progress\n'
 printf '  /usr/local/bin/nas-mount-migrate\n'
+printf '  /usr/local/bin/nas-status\n'
 printf '  /usr/local/bin/m365-backup-lib\n'
 printf '  /usr/local/bin/m365-backup-preflight\n'
 printf '  /usr/local/bin/m365-backup-inventory\n'
@@ -48,6 +51,7 @@ printf '  /etc/systemd/system/m365-backup.{service,timer}\n'
 printf '\nTry:\n'
 printf '  asustorctl status\n'
 printf '  fanspeed 200\n'
+printf '  nas-status\n'
 printf '  cloud-nas-status\n'
 printf '  cloud-nas-watch\n'
 printf '  cloud-nas-progress\n'
