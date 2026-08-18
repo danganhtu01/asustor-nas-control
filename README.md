@@ -232,6 +232,8 @@ controllers, the NICs — hottest reading wins.
 nas-fand --status     # temperatures, PWM, RPM. Read-only, no root.
 nas-fand --check      # validate the config; print the curve as a table
 nas-fand --dry-run    # decide against the real temperatures, write nothing
+nas-fand --simulate 62 70 69 68 67 66 60   # replay temperatures through the
+                                           # real decision logic, no hardware
 ```
 
 ```text

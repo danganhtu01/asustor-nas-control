@@ -59,9 +59,31 @@ At or above `FAN_CRIT_TEMP` (85 °C) the curve is ignored and the fan goes to
 full.
 
 **Hysteresis.** Ramping up is immediate; slowing down requires the temperature
-to have fallen `FAN_HYSTERESIS` degrees (4) below the reading that set the
-current level. Without this the fan audibly oscillates around every curve point,
-which is the most common complaint about fan daemons.
+to have fallen `FAN_HYSTERESIS` degrees (4) below the *peak* seen since the
+level was last changed. Without this the fan audibly oscillates around every
+curve point, which is the most common complaint about fan daemons.
+
+`--simulate` replays a sequence of temperatures through the real decision code,
+reading no sensor and writing nothing. It is how the curve and the hysteresis
+are tested, and it is the right way to check a curve change before trusting a
+fan to it:
+
+```console
+$ nas-fand --simulate 62 70 69 68 67 66 60
+TEMP    PWM     %      ACTION
+62C     136     53%    curve, ramp up
+70C     200     78%    curve, ramp up
+69C     200     78%    hold (curve says 192, peak seen 70C)
+68C     200     78%    hold (curve says 184, peak seen 70C)
+67C     200     78%    hold (curve says 176, peak seen 70C)
+66C     168     65%    curve, fell 4C from 70C
+60C     120     47%    curve, fell 4C from 66C
+
+$ FAN_CURVE="60:60 70:120 78:200 95:255" nas-fand --simulate 60 70 80 86
+```
+
+A 2 °C sawtooth around a curve point produces no change at all after the first
+climb, which is the property that matters for a machine you sit next to.
 
 Everything is in `/etc/nas-fan/nas-fan.conf`; `scripts/nas-fan.conf.example` is
 the annotated copy.

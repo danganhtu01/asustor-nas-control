@@ -47,7 +47,8 @@ FAN_TEMP_MAX_C="${FAN_TEMP_MAX_C:-150}"
 # Space-separated hwmon chip names to read; "auto" means every sane sensor.
 FAN_SOURCES="${FAN_SOURCES:-auto}"
 
-opt_once=0 opt_dry=0 opt_check=0 opt_status=0 opt_failsafe=0
+opt_once=0 opt_dry=0 opt_check=0 opt_status=0 opt_failsafe=0 opt_sim=0
+sim_temps=()
 
 usage() {
   cat <<'USAGE'
@@ -63,6 +64,10 @@ Options:
                    ExecStopPost runs, so a SIGKILLed daemon -- which never gets
                    to run its own trap -- still leaves the fan at full.
   -s, --status     Print current temperatures, PWM and RPM, then exit
+      --simulate T... Replay a sequence of temperatures through the real
+                   decision logic, writing nothing and reading no sensor. This
+                   is how the curve and the hysteresis are tested, and how you
+                   check a curve change before trusting a fan to it.
   -V, --version    Print version
   -h, --help       This text
 
@@ -84,6 +89,12 @@ while (($#)); do
     -n|--dry-run)  opt_dry=1; opt_once=1 ;;
     --check)       opt_check=1 ;;
     --failsafe)    opt_failsafe=1 ;;
+    --simulate)
+      opt_sim=1; opt_dry=1
+      shift
+      while (($#)) && [[ $1 =~ ^-?[0-9]+$ ]]; do sim_temps+=("$1"); shift; done
+      ((${#sim_temps[@]})) || { printf 'nas-fand: --simulate needs at least one temperature\n' >&2; exit 2; }
+      continue ;;
     -s|--status)   opt_status=1 ;;
     -V|--version)  printf 'nas-fand %s\n' "$NAS_FAND_VERSION"; exit 0 ;;
     -h|--help)     usage; exit 0 ;;
@@ -294,6 +305,34 @@ if ((opt_check)); then
   # The unit runs this as ExecStartPre, so it has to FAIL when the daemon could
   # not do its job -- not merely say so and exit 0.
   exit "$rc"
+fi
+
+if ((opt_sim)); then
+  sim_i=0
+  applied_pwm=-1; applied_temp=-999
+  printf '%-7s %-7s %-6s %s\n' 'TEMP' 'PWM' '%' 'ACTION'
+  for temp in "${sim_temps[@]}"; do
+    sim_i=$((sim_i + 1))
+    if (( temp >= FAN_CRIT_TEMP )); then target=255; reason="CRITICAL >= ${FAN_CRIT_TEMP}C"
+    else target=$(pwm_for_temp "$temp"); reason='curve'; fi
+
+    apply=0
+    if (( target > applied_pwm )); then apply=1; reason="$reason, ramp up"
+    elif (( target < applied_pwm )) && (( temp <= applied_temp - FAN_HYSTERESIS )); then
+      apply=1; reason="$reason, fell ${FAN_HYSTERESIS}C from ${applied_temp}C"
+    elif (( applied_pwm < 0 )); then apply=1; reason="$reason, first"
+    fi
+
+    if ((apply)); then
+      printf '%-7s %-7s %-6s %s\n' "${temp}C" "$target" "$(( target * 100 / 255 ))%" "$reason"
+      applied_pwm=$target; applied_temp=$temp
+    else
+      (( temp > applied_temp )) && applied_temp=$temp
+      printf '%-7s %-7s %-6s %s\n' "${temp}C" "$applied_pwm" "$(( applied_pwm * 100 / 255 ))%" \
+        "hold (curve says $target, peak seen ${applied_temp}C)"
+    fi
+  done
+  exit 0
 fi
 
 HW=$(fan_hwmon) || die "no IT87-class fan controller found (is asustor_it87 loaded?)"
