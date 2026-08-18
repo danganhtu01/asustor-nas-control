@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# One screen of health for the Microsoft 365 mirror. Read-only.
+
+lib=${M365_LIB:-$(dirname -- "$(readlink -f -- "$0")")/m365-backup-lib}
+[[ -r $lib ]] || { printf 'error: cannot find m365-backup-lib at %s\n' "$lib" >&2; exit 1; }
+# shellcheck source=./m365-backup-lib
+. "$lib"
+
+case "${1:-}" in
+  -h|--help) printf 'Usage: m365-backup-status\n\nRead-only health summary of the Microsoft 365 mirror.\n'; exit 0 ;;
+esac
+
+section() { printf '\n== %s ==\n' "$1"; }
+
+m365_load_conf 2>/dev/null || { printf 'no usable config at %s\n' "$M365_CONF" >&2; exit 1; }
+
+section 'Timer and service'
+systemctl list-timers 'm365-backup*' --all --no-pager 2>/dev/null || true
+systemctl --no-pager --plain status m365-backup.service 2>/dev/null | head -12 || true
+
+section 'Running rclone'
+pgrep -a -f 'rclone sync .*m365:' || printf '  (idle)\n'
+
+section 'Destination'
+if mountpoint -q -- "$M365_DEST_ROOT"; then
+  printf '  %s is mounted\n' "$M365_DEST_ROOT"
+else
+  printf '  \033[31mWARNING\033[0m %s is NOT a mountpoint -- sync will refuse to run\n' "$M365_DEST_ROOT"
+fi
+df -h "$M365_DEST_ROOT" 2>/dev/null | sed 's/^/  /' || true
+
+section 'Mirror size'
+if [[ -d $M365_DEST_ROOT/current ]]; then
+  du -sh "$M365_DEST_ROOT/current" 2>/dev/null | sed 's/^/  current  /' || true
+  du -sh "$M365_DEST_ROOT/archive" 2>/dev/null | sed 's/^/  archive  /' || true
+  printf '  drives   %s\n' "$(find "$M365_DEST_ROOT/current" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | wc -l)"
+  printf '  files    %s\n' "$(find "$M365_DEST_ROOT/current" -type f 2>/dev/null | wc -l)"
+else
+  printf '  (nothing mirrored yet)\n'
+fi
+
+section 'Manifest'
+man="$M365_STATE/drives.tsv"
+if [[ -r $man ]]; then
+  printf '  generated %s\n' "$(awk -F'generated ' '/^# generated/{print $2; exit}' "$man")"
+  printf '  onedrive  %s\n' "$(awk -F'\t' '$1=="onedrive"' "$man" | wc -l)"
+  printf '  sharepoint %s\n' "$(awk -F'\t' '$1=="sharepoint"' "$man" | wc -l)"
+else
+  printf '  (none -- run m365-backup-inventory)\n'
+fi
+
+section 'Last run'
+if [[ -r $M365_STATE/last-run ]]; then
+  last=$(<"$M365_STATE/last-run")
+  printf '  %s\n' "$last"
+  logdir="${M365_LOG_DIR:-$M365_DEST_ROOT/_logs}/$last"
+  if [[ -d $logdir ]]; then
+    errs=$(grep -lE 'ERROR|Failed to' "$logdir"/*.log 2>/dev/null | wc -l)
+    printf '  logs     %s\n' "$logdir"
+    printf '  with errors: %s of %s\n' "$errs" "$(find "$logdir" -name '*.log' | wc -l)"
+    if (( errs )); then
+      printf '\n  drives reporting errors:\n'
+      grep -lE 'ERROR|Failed to' "$logdir"/*.log 2>/dev/null | sed 's|.*/|    |' || true
+    fi
+  fi
+else
+  printf '  (never run)\n'
+fi
+
+section 'Token'
+if [[ -r $M365_STATE/token.json ]]; then
+  exp=$(jq -r '.expires_at // 0' "$M365_STATE/token.json")
+  now=$(date +%s)
+  if (( exp > now )); then
+    printf '  cached, expires in %d min\n' $(( (exp - now) / 60 ))
+  else
+    printf '  cached but expired (will be re-minted on next call)\n'
+  fi
+else
+  printf '  (none cached)\n'
+fi
+printf '\n'

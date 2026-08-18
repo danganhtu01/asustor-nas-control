@@ -1,0 +1,42 @@
+[Unit]
+Description=Mirror all Microsoft 365 OneDrive and SharePoint content to the NAS
+Documentation=file:///usr/local/share/doc/asustor-nas-control/m365-backup.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# Refresh the manifest first so new joiners and new sites are picked up without
+# anyone editing a list. Both steps are ordered and both must succeed.
+ExecStart=/usr/local/bin/m365-backup-inventory --quiet
+ExecStart=/usr/local/bin/m365-backup-sync
+
+# A tenant mirror takes hours on a home-office uplink; never time it out.
+TimeoutStartSec=0
+
+# Stay out of the way of whatever else the NAS is doing.
+Nice=10
+IOSchedulingClass=idle
+
+# This unit holds a credential that can read every drive in the tenant.
+# Narrow it as far as the job allows.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# ProtectSystem=strict makes everything read-only except what is listed here.
+# Edit ReadWritePaths to match M365_DEST_ROOT in m365-backup.conf.
+ReadWritePaths=/volume1/m365-backup /var/lib/m365-backup
+
+[Install]
+WantedBy=multi-user.target

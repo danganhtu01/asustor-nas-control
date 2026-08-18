@@ -1,0 +1,52 @@
+# /etc/m365-backup/m365-backup.conf
+# Sourced by m365-backup-lib. Shell syntax. Mode 0600.
+# Contains no secret itself -- only the path to one.
+
+# Entra tenant ID (Directory ID), not the domain name.
+M365_TENANT=''
+
+# Application (client) ID of the single backup app registration.
+# One registration, tenant-wide. Do not create one app per department: SharePoint
+# meters resource units per tenant, so extra AppIDs drain the same bucket faster,
+# and Microsoft documents this exact pattern as a reason applications get blocked.
+M365_CLIENT_ID=''
+
+# File holding the client secret and nothing else -- no trailing newline.
+#   install -d -m 0700 /etc/m365-backup
+#   printf %s 'THE-SECRET-VALUE' > /etc/m365-backup/client_secret
+#   chmod 400 /etc/m365-backup/client_secret
+M365_SECRET_FILE='/etc/m365-backup/client_secret'
+
+# Where the mirror lands. MUST be a mountpoint on the array -- the sync refuses to
+# run otherwise, because an unmounted array turns this into a bare directory on the
+# OS disk and a tenant mirror would fill it.
+#   $M365_DEST_ROOT/current/onedrive/<upn>/...
+#   $M365_DEST_ROOT/current/sharepoint/<site>/<library>/...
+#   $M365_DEST_ROOT/archive/<run-stamp>/...    replaced + deleted files
+#   $M365_DEST_ROOT/_logs/<run-stamp>/         one log per drive
+M365_DEST_ROOT='/volume1/m365-backup'
+
+# Optional ---------------------------------------------------------------------
+
+# Refuse to start below this many GiB free.
+#M365_MIN_FREE_GIB=50
+
+# Requests per second, tenant-wide. 8 is ~77% of the documented ceiling for a
+# tenant under 1,000 licences, leaving headroom for other apps on the same bucket.
+#M365_TPSLIMIT=8
+#M365_TRANSFERS=4
+#M365_CHECKERS=8
+
+# Cap bandwidth so a nightly run does not saturate the office uplink.
+# rclone syntax, e.g. '20M' or '08:00,1M 22:00,off'
+#M365_BWLIMIT=''
+
+#M365_STATE='/var/lib/m365-backup'
+#M365_LOG_DIR=''
+
+# Traffic decoration. NONISV is correct for an organisation's own internal tool;
+# ISV is for vendors shipping a product. Undecorated traffic is de-prioritised.
+#M365_USER_AGENT='NONISV|DangAssociates|NasBackup/1.0'
+
+# Set to 1 only if the destination is deliberately not a mountpoint.
+#M365_ALLOW_NON_MOUNTPOINT=0

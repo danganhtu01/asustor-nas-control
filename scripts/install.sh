@@ -13,6 +13,22 @@ install -Dm755 scripts/cloud-nas-status /usr/local/bin/cloud-nas-status
 install -Dm755 scripts/cloud-nas-sync-now /usr/local/bin/cloud-nas-sync-now
 install -Dm755 scripts/cloud-nas-watch /usr/local/bin/cloud-nas-watch
 install -Dm755 scripts/cloud-nas-progress /usr/local/bin/cloud-nas-progress
+install -Dm755 scripts/m365-backup-lib /usr/local/bin/m365-backup-lib
+install -Dm755 scripts/m365-backup-preflight /usr/local/bin/m365-backup-preflight
+install -Dm755 scripts/m365-backup-inventory /usr/local/bin/m365-backup-inventory
+install -Dm755 scripts/m365-backup-sync /usr/local/bin/m365-backup-sync
+install -Dm755 scripts/m365-backup-status /usr/local/bin/m365-backup-status
+install -Dm644 docs/m365-backup.md /usr/local/share/doc/asustor-nas-control/m365-backup.md
+install -Dm644 systemd/m365-backup.service /etc/systemd/system/m365-backup.service
+install -Dm644 systemd/m365-backup.timer /etc/systemd/system/m365-backup.timer
+
+# The config is never overwritten: it carries the tenant and client IDs, and the
+# path to a credential. Seed it once, then leave it alone on every later install.
+if [[ ! -e /etc/m365-backup/m365-backup.conf ]]; then
+  install -d -m 0700 /etc/m365-backup
+  install -m 0600 scripts/m365-backup.conf.example /etc/m365-backup/m365-backup.conf
+  seeded_conf=1
+fi
 
 printf 'Installed:\n'
 printf '  /usr/local/bin/asustorctl\n'
@@ -21,9 +37,27 @@ printf '  /usr/local/bin/cloud-nas-status\n'
 printf '  /usr/local/bin/cloud-nas-sync-now\n'
 printf '  /usr/local/bin/cloud-nas-watch\n'
 printf '  /usr/local/bin/cloud-nas-progress\n'
+printf '  /usr/local/bin/m365-backup-lib\n'
+printf '  /usr/local/bin/m365-backup-preflight\n'
+printf '  /usr/local/bin/m365-backup-inventory\n'
+printf '  /usr/local/bin/m365-backup-sync\n'
+printf '  /usr/local/bin/m365-backup-status\n'
+printf '  /etc/systemd/system/m365-backup.{service,timer}\n'
 printf '\nTry:\n'
 printf '  asustorctl status\n'
 printf '  fanspeed 200\n'
 printf '  cloud-nas-status\n'
 printf '  cloud-nas-watch\n'
 printf '  cloud-nas-progress\n'
+
+printf '\nMicrosoft 365 mirror (read docs/m365-backup.md first):\n'
+if [[ ${seeded_conf:-0} -eq 1 ]]; then
+  printf '  1. edit /etc/m365-backup/m365-backup.conf   # seeded from the example\n'
+else
+  printf '  1. /etc/m365-backup/m365-backup.conf already exists and was left untouched\n'
+fi
+printf '  2. printf %%s SECRET > /etc/m365-backup/client_secret && chmod 400 it\n'
+printf '  3. m365-backup-preflight                    # read-only, safe to run blind\n'
+printf '  4. m365-backup-inventory\n'
+printf '  5. m365-backup-sync --dry-run\n'
+printf '  6. systemctl daemon-reload && systemctl enable --now m365-backup.timer\n'

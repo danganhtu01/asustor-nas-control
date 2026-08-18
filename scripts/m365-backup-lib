@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+#
+# Shared helpers for the m365-backup-* scripts. Source it, do not run it.
+#
+# Everything here talks to Microsoft Graph with an APPLICATION (app-only) token.
+# There is no signed-in user anywhere in this path, by design: a delegated token
+# is intersected with some human's own permissions, and nobody in the company is
+# supposed to be able to read every colleague's OneDrive.
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  printf 'm365-backup-lib is a library; source it from another script\n' >&2
+  exit 64
+fi
+
+M365_CONF="${M365_CONF:-/etc/m365-backup/m365-backup.conf}"
+M365_STATE="${M365_STATE:-/var/lib/m365-backup}"
+# shellcheck disable=SC2034  # read by the scripts that source this file
+M365_GRAPH='https://graph.microsoft.com/v1.0'
+
+# SharePoint prioritises "decorated" traffic and de-prioritises anonymous traffic.
+# NONISV is the documented prefix for an organisation's own internal application;
+# ISV is for software vendors shipping a product, which this is not.
+M365_USER_AGENT="${M365_USER_AGENT:-NONISV|DangAssociates|NasBackup/1.0}"
+
+m365_die() { printf 'error: %s\n' "$1" >&2; exit "${2:-1}"; }
+
+m365_need() {
+  local c missing=()
+  for c in "$@"; do command -v "$c" >/dev/null 2>&1 || missing+=("$c"); done
+  if (( ${#missing[@]} )); then
+    m365_die "missing required command(s): ${missing[*]}"
+  fi
+}
+
+m365_load_conf() {
+  [[ -r $M365_CONF ]] || m365_die "cannot read $M365_CONF (copy m365-backup.conf.example into place)"
+  # shellcheck source=/dev/null
+  . "$M365_CONF"
+  : "${M365_TENANT:?M365_TENANT is not set in $M365_CONF}"
+  : "${M365_CLIENT_ID:?M365_CLIENT_ID is not set in $M365_CONF}"
+  : "${M365_SECRET_FILE:?M365_SECRET_FILE is not set in $M365_CONF}"
+  : "${M365_DEST_ROOT:?M365_DEST_ROOT is not set in $M365_CONF}"
+  [[ -r $M365_SECRET_FILE ]] || m365_die "cannot read client secret file: $M365_SECRET_FILE"
+
+  local mode
+  mode=$(stat -c '%a' "$M365_SECRET_FILE")
+  if [[ $mode != 400 && $mode != 600 ]]; then
+    m365_die "$M365_SECRET_FILE is mode $mode; it holds a credential that reads every drive in the tenant. chmod 400 it."
+  fi
+}
+
+# The single most valuable guard in this whole set.
+#
+# On a NAS the array can be absent at boot, or unmounted by a firmware update, and
+# the mountpoint is then an ordinary empty directory on the root filesystem. Syncing
+# a whole tenant into it fills the OS disk and takes the box down. Refuse instead.
+m365_require_mountpoint() {
+  local d=$1
+  [[ -d $d ]] || m365_die "destination does not exist: $d"
+  if ! mountpoint -q -- "$d"; then
+    if [[ ${M365_ALLOW_NON_MOUNTPOINT:-0} == 1 ]]; then
+      printf 'warning: %s is not a mountpoint; continuing because M365_ALLOW_NON_MOUNTPOINT=1\n' "$d" >&2
+    else
+      m365_die "refusing to run: $d is not a mountpoint.
+  This usually means the array is not mounted and the path is a bare directory on
+  the root filesystem. Writing a tenant mirror there would fill the OS disk.
+  Mount the array, or set M365_ALLOW_NON_MOUNTPOINT=1 if this path is deliberate."
+    fi
+  fi
+}
+
+m365_free_gib() {
+  df -PB1 "$1" 2>/dev/null | awk 'NR==2 {printf "%.0f", $4/1073741824}'
+}
+
+# Private scratch for the secret and for curl bodies. Never world-readable.
+m365_mktmp() {
+  local d
+  d=$(mktemp -d -t m365-backup.XXXXXXXX) || m365_die 'mktemp failed'
+  chmod 700 "$d"
+  printf '%s' "$d"
+}
+
+# --- token -------------------------------------------------------------------
+
+m365_mint_token() {
+  local tmp resp tok expires_in
+  tmp=$(m365_mktmp)
+
+  # $(<file) strips trailing newlines, which matters: curl's --data-urlencode
+  # name@file form sends the file verbatim and a stray \n corrupts the secret.
+  # Writing it to a private file keeps it out of argv, where ps would show it.
+  printf '%s' "$(<"$M365_SECRET_FILE")" >"$tmp/secret"
+  chmod 600 "$tmp/secret"
+
+  resp=$(curl -sS --max-time 60 \
+    -X POST "https://login.microsoftonline.com/${M365_TENANT}/oauth2/v2.0/token" \
+    -H "User-Agent: $M365_USER_AGENT" \
+    --data-urlencode "client_id=${M365_CLIENT_ID}" \
+    --data-urlencode "client_secret@${tmp}/secret" \
+    --data-urlencode 'scope=https://graph.microsoft.com/.default' \
+    --data-urlencode 'grant_type=client_credentials' 2>&1) || {
+      rm -rf -- "$tmp"; m365_die "token request failed: $resp"; }
+
+  rm -rf -- "$tmp"
+
+  tok=$(jq -r '.access_token // empty' <<<"$resp" 2>/dev/null || true)
+  if [[ -z $tok ]]; then
+    # Print the error code but never the whole body: it can echo the secret back.
+    m365_die "no access_token returned: $(jq -r '.error // "unparseable response"' <<<"$resp" 2>/dev/null || echo 'unparseable response')"
+  fi
+  expires_in=$(jq -r '.expires_in // 3600' <<<"$resp")
+
+  install -d -m 0700 -- "$M365_STATE"
+  ( umask 077
+    jq -n --arg t "$tok" --argjson e "$(( $(date +%s) + expires_in ))" \
+      '{access_token:$t, expires_at:$e}' >"$M365_STATE/token.json" )
+  printf '%s' "$tok"
+}
+
+m365_token() {
+  local cache="$M365_STATE/token.json" now exp tok
+  now=$(date +%s)
+  if [[ -r $cache ]]; then
+    exp=$(jq -r '.expires_at // 0' "$cache" 2>/dev/null || echo 0)
+    tok=$(jq -r '.access_token // empty' "$cache" 2>/dev/null || true)
+    # 120s of slack so a long request cannot straddle expiry.
+    if [[ -n $tok && $exp =~ ^[0-9]+$ ]] && (( now < exp - 120 )); then
+      printf '%s' "$tok"; return 0
+    fi
+  fi
+  m365_mint_token
+}
+
+# --- graph -------------------------------------------------------------------
+
+# m365_graph_get <url>  ->  body on stdout
+#   0  = ok
+#   44 = 404, the caller decides whether that is fatal
+#   1  = gave up
+#
+# Honouring Retry-After is not politeness. Throttled requests still count against
+# the tenant's resource-unit budget, so retrying early makes the throttle longer,
+# and sustained disregard gets the application blocked tenant-wide.
+m365_graph_get() {
+  local url="$1" attempt=0 code ra tmp hdr body
+  tmp=$(m365_mktmp); hdr="$tmp/h"; body="$tmp/b"
+
+  while :; do
+    code=$(curl -sS -o "$body" -D "$hdr" -w '%{http_code}' --max-time 180 \
+      -H "Authorization: Bearer $(m365_token)" \
+      -H "User-Agent: $M365_USER_AGENT" \
+      -H 'Accept: application/json' \
+      "$url" 2>/dev/null || printf '000')
+
+    case "$code" in
+      200)
+        cat "$body"; rm -rf -- "$tmp"; return 0 ;;
+      404)
+        rm -rf -- "$tmp"; return 44 ;;
+      401|403)
+        if (( attempt == 0 )); then
+          rm -f -- "$M365_STATE/token.json"   # stale token; mint once more
+        else
+          printf 'graph %s on %s\n  %s\n' "$code" "$url" \
+            "$(jq -r '.error.message // "no message"' "$body" 2>/dev/null || echo '?')" >&2
+          rm -rf -- "$tmp"; return 1
+        fi ;;
+      429|500|502|503|504|000)
+        ra=$(grep -i '^retry-after:' "$hdr" 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}')
+        [[ $ra =~ ^[0-9]+$ ]] || ra=$(( 5 * (attempt + 1) ))
+        (( ra > 900 )) && ra=900
+        printf 'graph %s; sleeping %ss before retry %d\n' "$code" "$ra" "$((attempt+1))" >&2
+        sleep "$ra" ;;
+      *)
+        printf 'graph %s on %s\n  %s\n' "$code" "$url" \
+          "$(jq -r '.error.message // "no message"' "$body" 2>/dev/null || echo '?')" >&2
+        rm -rf -- "$tmp"; return 1 ;;
+    esac
+
+    attempt=$(( attempt + 1 ))
+    if (( attempt > 8 )); then
+      printf 'graph: giving up on %s after %d attempts\n' "$url" "$attempt" >&2
+      rm -rf -- "$tmp"; return 1
+    fi
+  done
+}
+
+# m365_graph_pages <url>  ->  one JSON object per page on stdout
+m365_graph_pages() {
+  local url="$1" page next
+  while [[ -n $url ]]; do
+    page=$(m365_graph_get "$url") || return 1
+    printf '%s\n' "$page"
+    next=$(jq -r '."@odata.nextLink" // empty' <<<"$page")
+    url="$next"
+  done
+}
+
+# --- misc --------------------------------------------------------------------
+
+# Filesystem-safe, still human-readable. Keeps @ . - _ so UPNs survive intact.
+m365_slug() {
+  printf '%s' "$1" | tr -c 'A-Za-z0-9._@-' '_' | cut -c1-120
+}
+
+m365_log() { printf '%s  %s\n' "$(date -Is)" "$1"; }
+
+# rclone gained client_credentials (app-only OneDrive auth) in v1.69.0 on
+# 2025-01-12. Older builds cannot authenticate without a browser, which is
+# exactly what an unattended job must never require.
+m365_require_rclone() {
+  local rv major rest minor
+  m365_need rclone
+  rv=$(rclone version | awk 'NR==1{print $2}' | sed 's/^v//')
+  major=${rv%%.*}; rest=${rv#*.}; minor=${rest%%.*}; minor=${minor%%-*}
+  if [[ ! $major =~ ^[0-9]+$ || ! $minor =~ ^[0-9]+$ ]]; then
+    m365_die "cannot parse rclone version from '$rv'"
+  fi
+  if (( major < 1 || (major == 1 && minor < 69) )); then
+    m365_die "rclone $rv is too old: app-only OneDrive auth needs v1.69.0 or newer.
+  Install the upstream build, not the distro package:
+    curl -fsSL https://rclone.org/install.sh | sudo bash"
+  fi
+  printf '%s' "$rv"
+}

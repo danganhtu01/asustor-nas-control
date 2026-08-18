@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# Build the manifest of every drive in the tenant the backup should cover: one
+# OneDrive per licensed person, plus every document library on every SharePoint
+# site (which is what a "department folder" is, once Teams has created it).
+#
+# Read-only. Writes a TSV manifest and nothing else. Run it before every sync so
+# a new joiner or a new site is picked up without editing anything.
+
+usage() {
+  cat <<'EOF'
+Usage: m365-backup-inventory [--out FILE] [--users-only|--sites-only] [--quiet]
+
+  --out FILE     manifest path (default: $M365_STATE/drives.tsv)
+  --users-only   skip SharePoint site enumeration
+  --sites-only   skip per-user OneDrive enumeration
+  --quiet        only write the manifest, no progress on stderr
+
+Manifest columns (tab separated):
+  kind  dest_path  drive_id  drive_type  owner  label  web_url
+EOF
+}
+
+lib=${M365_LIB:-$(dirname -- "$(readlink -f -- "$0")")/m365-backup-lib}
+[[ -r $lib ]] || { printf 'error: cannot find m365-backup-lib at %s\n' "$lib" >&2; exit 1; }
+# shellcheck source=./m365-backup-lib
+. "$lib"
+
+out=''; do_users=1; do_sites=1; quiet=0
+
+while (( $# )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --out) out=${2:?--out needs a path}; shift 2 ;;
+    --out=*) out=${1#*=}; shift ;;
+    --users-only) do_sites=0; shift ;;
+    --sites-only) do_users=0; shift ;;
+    --quiet) quiet=1; shift ;;
+    *) printf 'error: unknown argument %s\n' "$1" >&2; usage >&2; exit 64 ;;
+  esac
+done
+
+m365_need curl jq
+m365_load_conf
+install -d -m 0700 -- "$M365_STATE"
+out=${out:-$M365_STATE/drives.tsv}
+
+say() { (( quiet )) || printf '%s\n' "$1" >&2; }
+
+tmp=$(m365_mktmp)
+trap 'rm -rf -- "$tmp"' EXIT
+man="$tmp/manifest"; : >"$man"
+
+emit() { printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7" >>"$man"; }
+
+n_od=0; n_sp=0; n_skip=0
+
+# --- OneDrive, one per person ------------------------------------------------
+#
+# Driven off the user list rather than off getAllSites, so a person who has never
+# opened OneDrive shows as an explicit skip instead of silently not existing, and
+# the folder on disk is named by UPN.
+
+if (( do_users )); then
+  say '==> enumerating users'
+  users="$tmp/users.json"
+  m365_graph_pages "$M365_GRAPH/users?\$select=id,userPrincipalName,displayName,accountEnabled&\$top=999" \
+    | jq -c '.value[]' >"$users"
+  say "    $(wc -l <"$users") directory objects"
+
+  while IFS=$'\t' read -r uid upn dname enabled; do
+    [[ $enabled == true ]] || { say "    skip (disabled)    $upn"; n_skip=$((n_skip+1)); continue; }
+
+    # A 404 means OneDrive was never provisioned -- the person has not opened it
+    # once. Repeatedly probing OneDrive site collections that do not exist is a
+    # documented way to get the calling IP throttled, so record it and move on.
+    set +e
+    drv=$(m365_graph_get "$M365_GRAPH/users/${uid}/drive?\$select=id,driveType,webUrl"); rc=$?
+    set -e
+    if (( rc == 44 )); then
+      say "    skip (no OneDrive) $upn"; n_skip=$((n_skip+1)); continue
+    elif (( rc != 0 )); then
+      say "    WARN cannot read drive for $upn"; n_skip=$((n_skip+1)); continue
+    fi
+
+    did=$(jq -r '.id' <<<"$drv")
+    dtype=$(jq -r '.driveType // "business"' <<<"$drv")
+    wurl=$(jq -r '.webUrl // ""' <<<"$drv")
+    [[ -n $did && $did != null ]] || { n_skip=$((n_skip+1)); continue; }
+
+    emit onedrive "onedrive/$(m365_slug "$upn")" "$did" "$dtype" "$upn" "$dname" "$wurl"
+    n_od=$((n_od+1)); say "    onedrive           $upn"
+  done < <(jq -r '[.id,.userPrincipalName,(.displayName//""),(.accountEnabled|tostring)] | @tsv' "$users")
+fi
+
+# --- SharePoint document libraries -------------------------------------------
+#
+# getAllSites is the documented way to enumerate a whole tenant app-only. It
+# returns personal sites too; those are filtered out because the user loop above
+# already covered them with better names.
+
+if (( do_sites )); then
+  say '==> enumerating SharePoint sites'
+  sites="$tmp/sites.json"
+  m365_graph_pages "$M365_GRAPH/sites/getAllSites" \
+    | jq -c '.value[] | select(.isPersonalSite != true)' >"$sites"
+  say "    $(wc -l <"$sites") non-personal sites"
+
+  while IFS=$'\t' read -r sid sname surl; do
+    set +e
+    drives=$(m365_graph_get "$M365_GRAPH/sites/${sid}/drives?\$select=id,name,driveType,webUrl"); rc=$?
+    set -e
+    (( rc == 0 )) || { say "    WARN no drives for site $sname"; continue; }
+
+    while IFS=$'\t' read -r did dname dtype wurl; do
+      [[ -n $did && $did != null ]] || continue
+      emit sharepoint \
+        "sharepoint/$(m365_slug "${sname:-site}")/$(m365_slug "${dname:-Documents}")" \
+        "$did" "$dtype" "$surl" "$dname" "$wurl"
+      n_sp=$((n_sp+1)); say "    sharepoint         ${sname} / ${dname}"
+    done < <(jq -r '.value[] | [.id,(.name//"Documents"),(.driveType//"documentLibrary"),(.webUrl//"")] | @tsv' <<<"$drives")
+  done < <(jq -r '[.id,(.name//.displayName//"site"),(.webUrl//"")] | @tsv' "$sites")
+fi
+
+# --- publish atomically ------------------------------------------------------
+
+if [[ ! -s $man ]]; then
+  m365_die 'manifest is empty; refusing to overwrite the previous one. Check the app registration has Files.Read.All + Sites.Read.All + User.Read.All granted as APPLICATION permissions with admin consent.'
+fi
+
+( umask 077
+  {
+    printf '# m365 drive manifest\n'
+    printf '# generated %s\n' "$(date -Is)"
+    printf '# kind\tdest_path\tdrive_id\tdrive_type\towner\tlabel\tweb_url\n'
+    sort -t$'\t' -k1,1 -k2,2 "$man"
+  } >"$out.new" )
+mv -- "$out.new" "$out"
+
+say ''
+say "manifest: $out"
+say "  onedrive drives : $n_od"
+say "  sharepoint libs : $n_sp"
+say "  skipped         : $n_skip"
+(( quiet )) || printf '%s\n' "$out"

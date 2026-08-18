@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# Pull every drive in the manifest down to the NAS with rclone, one at a time.
+#
+# Strictly serial, and that is the whole trick. SharePoint's resource-unit budget
+# is per-application-per-tenant, not per-connection: running twenty rclone
+# processes in parallel does not multiply throughput, it multiplies the request
+# rate against one shared bucket and turns the run into a wall of 429s. One
+# process at a time makes --tpslimit a real tenant-wide ceiling.
+
+usage() {
+  cat <<'EOF'
+Usage: m365-backup-sync [options]
+
+  --manifest FILE   drive manifest (default: $M365_STATE/drives.tsv)
+  --only REGEX      only sync drives whose dest_path matches REGEX
+  --kind KIND       onedrive | sharepoint (default: both)
+  --dry-run         pass --dry-run to rclone; changes nothing
+  --no-archive      do not keep replaced/deleted files (skips --backup-dir)
+  --permissions     also capture sharing permissions as metadata (slow, see below)
+  --skip-preflight  do not run m365-backup-preflight first (not recommended)
+  -h, --help
+
+Notes:
+  --permissions makes every listed item cost 5 resource units instead of 1-2.
+  Run it weekly at most, never on the nightly job.
+EOF
+}
+
+lib=${M365_LIB:-$(dirname -- "$(readlink -f -- "$0")")/m365-backup-lib}
+[[ -r $lib ]] || { printf 'error: cannot find m365-backup-lib at %s\n' "$lib" >&2; exit 1; }
+# shellcheck source=./m365-backup-lib
+. "$lib"
+
+manifest=''; only=''; kind=''; dry=0; archive=1; perms=0; skip_pre=0
+
+while (( $# )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --manifest) manifest=${2:?--manifest needs a path}; shift 2 ;;
+    --manifest=*) manifest=${1#*=}; shift ;;
+    --only) only=${2:?--only needs a regex}; shift 2 ;;
+    --only=*) only=${1#*=}; shift ;;
+    --kind) kind=${2:?--kind needs a value}; shift 2 ;;
+    --kind=*) kind=${1#*=}; shift ;;
+    --dry-run) dry=1; shift ;;
+    --no-archive) archive=0; shift ;;
+    --permissions) perms=1; shift ;;
+    --skip-preflight) skip_pre=1; shift ;;
+    *) printf 'error: unknown argument %s\n' "$1" >&2; usage >&2; exit 64 ;;
+  esac
+done
+
+case "$kind" in ''|onedrive|sharepoint) ;; *) m365_die "--kind must be onedrive or sharepoint, got '$kind'" ;; esac
+
+m365_need rclone jq curl flock
+rv=$(m365_require_rclone)
+m365_load_conf
+manifest=${manifest:-$M365_STATE/drives.tsv}
+[[ -r $manifest ]] || m365_die "no manifest at $manifest -- run m365-backup-inventory first"
+
+# The array must be mounted. See the comment on m365_require_mountpoint.
+m365_require_mountpoint "$M365_DEST_ROOT"
+
+free=$(m365_free_gib "$M365_DEST_ROOT")
+if (( free < ${M365_MIN_FREE_GIB:-50} )); then
+  m365_die "only ${free} GiB free on $M365_DEST_ROOT, floor is ${M365_MIN_FREE_GIB:-50} GiB"
+fi
+
+if (( ! skip_pre && ! dry )); then
+  pre=$(command -v m365-backup-preflight || printf '%s' "$(dirname -- "$(readlink -f -- "$0")")/m365-backup-preflight")
+  if [[ -x $pre ]]; then
+    "$pre" --quiet || m365_die 'preflight failed; fix the above or pass --skip-preflight'
+  fi
+fi
+
+# --- single instance ---------------------------------------------------------
+
+install -d -m 0700 -- "$M365_STATE"
+exec 9>"$M365_STATE/sync.lock"
+flock -n 9 || m365_die 'another m365-backup-sync is already running'
+
+# --- private rclone config ---------------------------------------------------
+#
+# Built per run in a 0700 tmpdir so the client secret never lands in a durable
+# rclone.conf, and never appears in argv where ps would show it to every user.
+
+tmp=$(m365_mktmp)
+trap 'rm -rf -- "$tmp"' EXIT
+conf="$tmp/rclone.conf"
+( umask 077
+  cat >"$conf" <<EOF
+[m365]
+type = onedrive
+client_id = ${M365_CLIENT_ID}
+client_secret = $(<"$M365_SECRET_FILE")
+tenant = ${M365_TENANT}
+client_credentials = true
+EOF
+)
+
+stamp=$(date +%Y%m%dT%H%M%S)
+logdir="${M365_LOG_DIR:-$M365_DEST_ROOT/_logs}/$stamp"
+install -d -m 0750 -- "$logdir"
+
+# Resource-unit arithmetic for a tenant in the 0-1,000 licence band:
+#   1,250 RU/min per app per tenant; Microsoft's own rule of thumb is ~2 RU per
+#   request, i.e. ~625 req/min ~= 10.4 req/s as the documented ceiling.
+#   8 req/s leaves headroom for other applications sharing the same bucket.
+tps=${M365_TPSLIMIT:-8}
+transfers=${M365_TRANSFERS:-4}
+checkers=${M365_CHECKERS:-8}
+
+common=(
+  --config "$conf"
+  --user-agent "$M365_USER_AGENT"
+  --tpslimit "$tps" --tpslimit-burst "$tps"
+  --transfers "$transfers" --checkers "$checkers"
+  --retries 3 --low-level-retries 10
+  --timeout 5m --contimeout 1m
+  --onedrive-delta
+  --onedrive-av-override
+  --create-empty-src-dirs
+  --stats 1m --stats-log-level NOTICE
+  --log-level INFO
+)
+(( dry )) && common+=(--dry-run)
+(( perms )) && common+=(--metadata --onedrive-metadata-permissions read)
+[[ -n ${M365_BWLIMIT:-} ]] && common+=(--bwlimit "$M365_BWLIMIT")
+
+total=0; ok=0; failed=0
+declare -a failures=()
+
+m365_log "run $stamp starting: rclone $rv, tpslimit $tps, dest $M365_DEST_ROOT, free ${free} GiB"
+(( dry )) && m365_log 'DRY RUN -- nothing will be written'
+
+# owner and wurl are named only to consume their manifest columns positionally.
+# shellcheck disable=SC2034
+while IFS=$'\t' read -r k dest did dtype owner label wurl; do
+  [[ $k == \#* || -z $k ]] && continue
+  [[ -z $kind || $k == "$kind" ]] || continue
+  [[ -z $only || $dest =~ $only ]] || continue
+
+  total=$(( total + 1 ))
+  target="$M365_DEST_ROOT/current/$dest"
+  log="$logdir/$(m365_slug "$dest").log"
+  install -d -m 0750 -- "$target"
+
+  args=("${common[@]}")
+  if (( archive )); then
+    # Replaced and deleted files move here instead of vanishing. This is the only
+    # version history the backup has: rclone copies the current version of a file
+    # and cannot see OneDrive's own version stack at all.
+    args+=(--backup-dir "$M365_DEST_ROOT/archive/$stamp/$dest")
+  fi
+
+  m365_log "sync  $k  $dest  ($label)"
+
+  # drive_id / drive_type arrive per drive as backend env vars, which sit above
+  # the config file in rclone's precedence order and below explicit flags.
+  if RCLONE_ONEDRIVE_DRIVE_ID="$did" \
+     RCLONE_ONEDRIVE_DRIVE_TYPE="$dtype" \
+     rclone sync "m365:" "$target" "${args[@]}" --log-file "$log"
+  then
+    ok=$(( ok + 1 ))
+  else
+    rc=$?
+    failed=$(( failed + 1 ))
+    failures+=("$dest (rclone exit $rc, see $log)")
+    m365_log "FAIL  $dest  rclone exit $rc"
+  fi
+done < "$manifest"
+
+m365_log "run $stamp finished: $ok ok, $failed failed, $total total"
+printf '%s\n' "$stamp" >"$M365_STATE/last-run"
+
+if (( failed )); then
+  printf '\nfailures:\n' >&2
+  printf '  %s\n' "${failures[@]}" >&2
+  exit 1
+fi

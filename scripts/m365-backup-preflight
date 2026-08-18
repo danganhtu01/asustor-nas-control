@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# Read-only. Checks everything m365-backup-sync depends on, and changes nothing.
+# Safe to run blind on a box you are not sure about.
+
+usage() {
+  cat <<'EOF'
+Usage: m365-backup-preflight [--quiet]
+
+Checks, in order:
+  config readable and complete       secret file permissions
+  rclone present and >= v1.69.0      destination is a mounted filesystem
+  free space on the destination      Graph token mints
+  the three Application permissions  manifest freshness
+
+Exit 0 if everything passed, 1 if any check failed.
+EOF
+}
+
+quiet=0
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  --quiet) quiet=1 ;;
+  '') ;;
+  *) printf 'error: unknown argument %s\n' "$1" >&2; usage >&2; exit 64 ;;
+esac
+
+lib=${M365_LIB:-$(dirname -- "$(readlink -f -- "$0")")/m365-backup-lib}
+[[ -r $lib ]] || { printf 'error: cannot find m365-backup-lib at %s\n' "$lib" >&2; exit 1; }
+# shellcheck source=./m365-backup-lib
+. "$lib"
+
+pass=0; fail=0
+ok()   { (( quiet )) || printf '  \033[32mok\033[0m    %s\n' "$1"; pass=$(( pass + 1 )); }
+bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$1" >&2; fail=$(( fail + 1 )); }
+note() { (( quiet )) || printf '        %s\n' "$1"; }
+
+printf '== m365-backup preflight ==\n\n'
+
+# --- tools -------------------------------------------------------------------
+if command -v curl >/dev/null && command -v jq >/dev/null && command -v flock >/dev/null; then
+  ok 'curl, jq, flock present'
+else
+  bad 'missing one of curl / jq / flock'
+fi
+
+rv=''
+if rv=$(m365_require_rclone 2>&1); then
+  ok "rclone $rv (>= 1.69.0, supports app-only auth)"
+else
+  bad "rclone: $rv"
+fi
+
+# --- config ------------------------------------------------------------------
+if m365_load_conf 2>/dev/null; then
+  ok "config readable: $M365_CONF"
+  note "tenant    $M365_TENANT"
+  note "client id $M365_CLIENT_ID"
+  note "dest      $M365_DEST_ROOT"
+else
+  bad "config: $(m365_load_conf 2>&1 | head -1)"
+  printf '\n%d passed, %d failed\n' "$pass" "$fail"
+  exit 1
+fi
+
+mode=$(stat -c '%a' "$M365_SECRET_FILE" 2>/dev/null || echo '???')
+if [[ $mode == 400 || $mode == 600 ]]; then
+  ok "secret file mode $mode"
+else
+  bad "secret file mode $mode -- must be 400 or 600"
+fi
+
+if [[ -s $M365_SECRET_FILE ]]; then
+  if [[ $(tail -c1 "$M365_SECRET_FILE" | wc -l) -eq 0 ]]; then
+    ok 'secret file has no trailing newline'
+  else
+    bad "secret file ends with a newline -- rewrite it with: printf %s 'SECRET' > $M365_SECRET_FILE"
+  fi
+else
+  bad 'secret file is empty'
+fi
+
+# --- destination -------------------------------------------------------------
+if [[ -d $M365_DEST_ROOT ]]; then
+  ok "destination exists: $M365_DEST_ROOT"
+  if mountpoint -q -- "$M365_DEST_ROOT"; then
+    ok "destination is a mounted filesystem"
+  elif [[ ${M365_ALLOW_NON_MOUNTPOINT:-0} == 1 ]]; then
+    ok 'destination is not a mountpoint (allowed by M365_ALLOW_NON_MOUNTPOINT=1)'
+  else
+    bad "destination is NOT a mountpoint -- the array is probably not mounted"
+  fi
+  free=$(m365_free_gib "$M365_DEST_ROOT")
+  if [[ ${free:-0} -ge ${M365_MIN_FREE_GIB:-50} ]]; then
+    ok "free space ${free} GiB"
+  else
+    bad "free space ${free} GiB is below the ${M365_MIN_FREE_GIB:-50} GiB floor"
+  fi
+  if [[ -w $M365_DEST_ROOT ]]; then
+    ok 'destination is writable by this user'
+  else
+    bad "destination is not writable by $(id -un)"
+  fi
+else
+  bad "destination does not exist: $M365_DEST_ROOT"
+fi
+
+# --- graph -------------------------------------------------------------------
+if tok=$(m365_token 2>&1) && [[ -n $tok && $tok != *error* ]]; then
+  ok 'Graph token minted (client credentials)'
+else
+  bad "token: $(printf '%s' "$tok" | head -1)"
+  printf '\n%d passed, %d failed\n' "$pass" "$fail"
+  exit 1
+fi
+
+# Each of the three Application permissions is probed by the cheapest call that
+# needs it, so a missing admin consent is named precisely instead of surfacing
+# later as an opaque 403 halfway through a sync.
+probe() {
+  local label=$1 url=$2 out rc
+  set +e
+  out=$(m365_graph_get "$url" 2>&1); rc=$?
+  set -e
+  if (( rc == 0 )); then ok "$label"; else bad "$label -- $(printf '%s' "$out" | head -1)"; fi
+}
+probe 'User.Read.All   (list users)'        "$M365_GRAPH/users?\$select=id&\$top=1"
+probe 'Sites.Read.All  (enumerate sites)'   "$M365_GRAPH/sites/getAllSites"
+probe 'Files.Read.All  (read a drive)'      "$M365_GRAPH/drives?\$top=1"
+
+# --- manifest ----------------------------------------------------------------
+man="$M365_STATE/drives.tsv"
+if [[ -r $man ]]; then
+  age=$(( ( $(date +%s) - $(stat -c %Y "$man") ) / 86400 ))
+  n=$(grep -cv '^#' "$man" || true)
+  if (( age <= 7 )); then
+    ok "manifest present: $n drives, ${age}d old"
+  else
+    ok "manifest present: $n drives, ${age}d old (stale -- rerun m365-backup-inventory)"
+  fi
+else
+  note 'no manifest yet -- run m365-backup-inventory'
+fi
+
+printf '\n%d passed, %d failed\n' "$pass" "$fail"
+(( fail == 0 ))

@@ -280,6 +280,31 @@ tail -f /home/atdang/.local/state/cloud-nas/rclone-sync-OneDrive-Personal.log
 tail -f /home/atdang/.local/state/cloud-nas/rclone-sync-GoogleDrive-Personal.log
 ```
 
+## Microsoft 365 Mirror
+
+Nightly read-only mirror of every OneDrive and SharePoint document library in the
+tenant, onto the array. No human signs in: a single Entra app registration with
+**Application** permissions authenticates as itself.
+
+```bash
+m365-backup-preflight     # read-only; run this first
+m365-backup-inventory     # rebuild the drive manifest
+m365-backup-sync --dry-run
+m365-backup-sync
+m365-backup-status
+```
+
+Requires **rclone v1.69.0 or newer** — app-only OneDrive auth does not exist in
+older builds, and distro packages are well behind. The scripts refuse rather than
+fail obscurely.
+
+The sync **will not run unless `M365_DEST_ROOT` is a mounted filesystem**. An
+unmounted array is an ordinary directory on the OS disk, and a tenant mirror would
+fill it.
+
+Full setup, limitations and restore procedure: [`docs/m365-backup.md`](docs/m365-backup.md).
+
+
 ## Notes
 
 - `fanspeed 200` means raw PWM value `200`, on a `0..255` scale.

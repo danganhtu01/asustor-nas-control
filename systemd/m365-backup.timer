@@ -1,0 +1,17 @@
+[Unit]
+Description=Nightly Microsoft 365 mirror
+
+[Timer]
+# Off-peak for SharePoint throttling is nights and weekends in the tenant's own
+# time zone, so this wants to be local night, not UTC night.
+OnCalendar=*-*-* 01:00:00
+
+# Not decoration: it stops every scheduled job in the estate hitting Graph at
+# the same instant.
+RandomizedDelaySec=1800
+
+# Catch up after the NAS has been powered off.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
