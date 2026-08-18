@@ -82,28 +82,29 @@ else
 fi
 
 # --- destination -------------------------------------------------------------
-if [[ -d $M365_DEST_ROOT ]]; then
-  ok "destination exists: $M365_DEST_ROOT"
-  if mountpoint -q -- "$M365_DEST_ROOT"; then
-    ok "destination is a mounted filesystem"
+note "volume    $M365_VOLUME_ROOT"
+if [[ -d $M365_VOLUME_ROOT ]]; then
+  ok "volume exists: $M365_VOLUME_ROOT"
+  if mountpoint -q -- "$M365_VOLUME_ROOT"; then
+    ok 'volume is a mounted filesystem'
   elif [[ ${M365_ALLOW_NON_MOUNTPOINT:-0} == 1 ]]; then
-    ok 'destination is not a mountpoint (allowed by M365_ALLOW_NON_MOUNTPOINT=1)'
+    ok 'volume is not a mountpoint (allowed by M365_ALLOW_NON_MOUNTPOINT=1)'
   else
-    bad "destination is NOT a mountpoint -- the array is probably not mounted"
+    bad "volume is NOT a mountpoint -- the array is probably not mounted"
   fi
-  free=$(m365_free_gib "$M365_DEST_ROOT")
+  free=$(m365_free_gib "$M365_VOLUME_ROOT")
   if [[ ${free:-0} -ge ${M365_MIN_FREE_GIB:-50} ]]; then
     ok "free space ${free} GiB"
   else
     bad "free space ${free} GiB is below the ${M365_MIN_FREE_GIB:-50} GiB floor"
   fi
-  if [[ -w $M365_DEST_ROOT ]]; then
+  if [[ -w $M365_VOLUME_ROOT || -w $M365_DEST_ROOT ]]; then
     ok 'destination is writable by this user'
   else
     bad "destination is not writable by $(id -un)"
   fi
 else
-  bad "destination does not exist: $M365_DEST_ROOT"
+  bad "volume does not exist: $M365_VOLUME_ROOT"
 fi
 
 # --- graph -------------------------------------------------------------------

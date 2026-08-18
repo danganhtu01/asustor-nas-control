@@ -2,6 +2,8 @@
 # Sourced by m365-backup-lib. Shell syntax. Mode 0600.
 # Contains no secret itself -- only the path to one.
 
+# --- identity (required) ------------------------------------------------------
+
 # Entra tenant ID (Directory ID), not the domain name.
 M365_TENANT=''
 
@@ -17,16 +19,39 @@ M365_CLIENT_ID=''
 #   chmod 400 /etc/m365-backup/client_secret
 M365_SECRET_FILE='/etc/m365-backup/client_secret'
 
-# Where the mirror lands. MUST be a mountpoint on the array -- the sync refuses to
-# run otherwise, because an unmounted array turns this into a bare directory on the
-# OS disk and a tenant mirror would fill it.
+# --- where it lands -----------------------------------------------------------
+#
+# Composed, never written out literally:
+#
+#     M365_DEST_ROOT = NAS_MOUNT_BASE / NAS_M365_VOLUME / M365_SUBDIR
+#
+# Override any single layer here, or export it for a one-off run. Relocating a
+# volume is then a variable change rather than a hunt through scripts.
+#
+# The default targets NAS_03 on purpose: that volume is where the existing cloud
+# mirror sweep writes, so anything placed there is carried into the nightly
+# NAS_03 -> NAS_02 snapshot with no extra wiring.
+
+#NAS_MOUNT_BASE='/srv'
+#NAS_M365_VOLUME='NAS_03'
+#M365_SUBDIR='m365'
+
+# Setting this explicitly overrides all three layers above.
+#M365_DEST_ROOT=''
+
+# The volume that must genuinely be mounted. Defaults to
+# $NAS_MOUNT_BASE/$NAS_M365_VOLUME. The sync refuses to start unless this is a
+# real mountpoint -- an unmounted volume is just a directory, and a tenant mirror
+# written into one fills whatever filesystem is actually underneath.
+#M365_VOLUME_ROOT=''
+
+# Resulting layout:
 #   $M365_DEST_ROOT/current/onedrive/<upn>/...
 #   $M365_DEST_ROOT/current/sharepoint/<site>/<library>/...
 #   $M365_DEST_ROOT/archive/<run-stamp>/...    replaced + deleted files
 #   $M365_DEST_ROOT/_logs/<run-stamp>/         one log per drive
-M365_DEST_ROOT='/volume1/m365-backup'
 
-# Optional ---------------------------------------------------------------------
+# --- tuning (optional) --------------------------------------------------------
 
 # Refuse to start below this many GiB free.
 #M365_MIN_FREE_GIB=50
@@ -48,5 +73,5 @@ M365_DEST_ROOT='/volume1/m365-backup'
 # ISV is for vendors shipping a product. Undecorated traffic is de-prioritised.
 #M365_USER_AGENT='NONISV|DangAssociates|NasBackup/1.0'
 
-# Set to 1 only if the destination is deliberately not a mountpoint.
+# Set to 1 only if the volume is deliberately not a mountpoint.
 #M365_ALLOW_NON_MOUNTPOINT=0

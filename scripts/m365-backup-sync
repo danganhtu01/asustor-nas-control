@@ -60,8 +60,11 @@ m365_load_conf
 manifest=${manifest:-$M365_STATE/drives.tsv}
 [[ -r $manifest ]] || m365_die "no manifest at $manifest -- run m365-backup-inventory first"
 
-# The array must be mounted. See the comment on m365_require_mountpoint.
-m365_require_mountpoint "$M365_DEST_ROOT"
+# Check the VOLUME, not our subdirectory: the subdirectory is ours to create, so
+# its existence proves nothing. What matters is that the volume underneath it is
+# genuinely mounted. See the comment on m365_require_mountpoint.
+m365_require_mountpoint "$M365_VOLUME_ROOT"
+install -d -m 0750 -- "$M365_DEST_ROOT"
 
 free=$(m365_free_gib "$M365_DEST_ROOT")
 if (( free < ${M365_MIN_FREE_GIB:-50} )); then

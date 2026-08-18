@@ -110,10 +110,62 @@ sudo systemctl enable --now m365-backup.timer
 systemctl list-timers m365-backup.timer
 ```
 
-> **Edit `ReadWritePaths=` in the unit** if `M365_DEST_ROOT` is not
-> `/volume1/m365-backup`. `ProtectSystem=strict` makes the whole filesystem
-> read-only apart from what that line lists, so a mismatch fails the run with a
-> permission error that looks nothing like a path problem.
+> **Re-run `install.sh` after changing the destination.** `ProtectSystem=strict`
+> makes the filesystem read-only apart from `ReadWritePaths=`, and the installer
+> generates that from the config into
+> `/etc/systemd/system/m365-backup.service.d/destination.conf`. Skip it and the
+> run fails with a permission error that looks nothing like a path problem.
+
+## Paths are composed, never hardcoded
+
+Nothing in this repository contains a literal mirror path. The destination is
+built from layers, each independently overridable in the config file or from the
+environment for a one-off run:
+
+```
+M365_DEST_ROOT  =  NAS_MOUNT_BASE / NAS_M365_VOLUME / M365_SUBDIR
+       default        /srv              NAS_03           m365
+```
+
+**The default targets NAS_03 on purpose.** That volume is where the existing
+cloud-mirror sweep writes, so anything landing there is carried into the nightly
+NAS_03 → NAS_02 snapshot with no extra wiring. The Microsoft 365 mirror joins the
+backup sweep already in place rather than needing one of its own.
+
+`M365_VOLUME_ROOT` (default `$NAS_MOUNT_BASE/$NAS_M365_VOLUME`) is the part that
+must genuinely be a mountpoint. The subdirectory beneath it is ours to create, so
+its existence proves nothing — the guard deliberately checks the volume.
+
+## Moving the mountpoints
+
+`nas-mount-migrate` relocates the data volumes between mount bases, keeping the
+volume labels as directory names, and rewrites `/etc/fstab` to match.
+
+```bash
+nas-mount-migrate --from /run/media/$USER --to /srv --dry-run
+nas-mount-migrate --from /run/media/$USER --to /srv
+```
+
+It refuses unless no sync job is running, every source is mounted, and every
+target is free; it validates the rewritten fstab before installing it; and it
+unwinds — restoring fstab **and remounting the volumes** — on any failure,
+including a failed verification.
+
+Two things it taught us, both worth keeping in mind generally:
+
+- **`mount` returns 0 without mounting when the entry carries `nofail`.** That is
+  exactly what `nofail` means. The only trustworthy check is to ask the kernel
+  afterwards with `mountpoint`.
+- **`findmnt --verify` exits non-zero on a perfectly healthy fstab**, for reasons
+  that predate any given change. The migration compares error counts before and
+  after instead, so it aborts on regressions rather than on pre-existing noise.
+
+After it runs, update anything still referencing the old base and only then
+restart the sync loops:
+
+```bash
+grep -rn '/run/media' ~ /etc/systemd 2>/dev/null
+```
 
 ## Layout on disk
 

@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+set -euo pipefail
+#
+# Move the data-volume mountpoints from one base directory to another, keeping
+# the volume labels as the directory names.
+#
+# Written for the /run/media/atdang -> /srv move, but nothing about either path
+# is baked in: sources come from /etc/fstab by label pattern, the destination
+# base is a variable. Run with --from and --to, or set NAS_MIGRATE_FROM/TO.
+#
+# Why the move matters: /run is a tmpfs. A volume that fails to mount there
+# leaves an ordinary directory in RAM, and anything that writes to it consumes
+# memory until the box dies. Under /srv the same failure writes to the root
+# filesystem instead -- still wrong, but visible, bounded and recoverable.
+
+usage() {
+  cat <<'EOF'
+Usage: nas-mount-migrate [options]
+
+  --from DIR      current mount base            (env NAS_MIGRATE_FROM)
+  --to DIR        new mount base                (env NAS_MIGRATE_TO,   default /srv)
+  --label-glob G  fstab LABEL= pattern to move  (env NAS_MIGRATE_GLOB, default 'NAS_*')
+  --dry-run       print the plan and change nothing
+  --force         skip the "no sync jobs running" refusal (NOT recommended)
+  -h, --help
+
+Refuses unless every one of these holds:
+  running as root                     no rclone or sync loop is running
+  every source is currently mounted   every target is free
+  the rewritten fstab parses          each volume still has its data afterwards
+
+Writes a timestamped fstab backup and restores it automatically on any failure.
+EOF
+}
+
+FROM=${NAS_MIGRATE_FROM:-}
+TO=${NAS_MIGRATE_TO:-/srv}
+GLOB=${NAS_MIGRATE_GLOB:-NAS_*}
+FSTAB=${NAS_MIGRATE_FSTAB:-/etc/fstab}
+dry=0
+force=0
+
+while (( $# )); do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --from) FROM=${2:?--from needs a directory}; shift 2 ;;
+    --from=*) FROM=${1#*=}; shift ;;
+    --to) TO=${2:?--to needs a directory}; shift 2 ;;
+    --to=*) TO=${1#*=}; shift ;;
+    --label-glob) GLOB=${2:?--label-glob needs a pattern}; shift 2 ;;
+    --label-glob=*) GLOB=${1#*=}; shift ;;
+    --dry-run) dry=1; shift ;;
+    --force) force=1; shift ;;
+    *) printf 'error: unknown argument %s\n' "$1" >&2; usage >&2; exit 64 ;;
+  esac
+done
+
+die() { printf 'error: %s\n' "$1" >&2; exit "${2:-1}"; }
+say() { printf '%s\n' "$1"; }
+
+[[ -n $FROM ]] || die "--from is required (current mount base, e.g. /run/media/\$USER)"
+FROM=${FROM%/}; TO=${TO%/}
+[[ $FROM != "$TO" ]] || die "--from and --to are the same: $FROM"
+[[ $TO == /* ]] || die "--to must be an absolute path: $TO"
+[[ -r $FSTAB ]] || die "cannot read $FSTAB"
+
+if (( ! dry )) && [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  die "must run as root (it edits $FSTAB and remounts filesystems)"
+fi
+
+# --- discover what to move ---------------------------------------------------
+#
+# Read the labels out of fstab rather than taking them as arguments, so the
+# script cannot be pointed at a volume that is not actually managed there.
+
+declare -a LABELS=() OLDDIRS=() NEWDIRS=()
+while read -r label target; do
+  [[ -n $label ]] || continue
+  LABELS+=("$label"); OLDDIRS+=("$target"); NEWDIRS+=("$TO/$label")
+done < <(awk -v base="$FROM" '
+  /^[[:space:]]*#/ { next }
+  $1 ~ /^LABEL=/ && index($2, base "/") == 1 {
+    sub(/^LABEL=/, "", $1); print $1, $2
+  }' "$FSTAB")
+
+(( ${#LABELS[@]} )) || die "no fstab entries with LABEL= mounted under $FROM"
+
+# Honour the label glob as a filter.
+declare -a kL=() kO=() kN=()
+for i in "${!LABELS[@]}"; do
+  # shellcheck disable=SC2053  # glob match is intentional
+  if [[ ${LABELS[i]} == $GLOB ]]; then kL+=("${LABELS[i]}"); kO+=("${OLDDIRS[i]}"); kN+=("${NEWDIRS[i]}"); fi
+done
+LABELS=("${kL[@]}"); OLDDIRS=("${kO[@]}"); NEWDIRS=("${kN[@]}")
+(( ${#LABELS[@]} )) || die "no fstab entries under $FROM matched label glob '$GLOB'"
+
+say "== plan =="
+for i in "${!LABELS[@]}"; do
+  printf '  %-8s  %s  ->  %s\n' "${LABELS[i]}" "${OLDDIRS[i]}" "${NEWDIRS[i]}"
+done
+say ''
+
+# --- refusals ----------------------------------------------------------------
+
+say "== checks =="
+
+# Anything actively syncing is the thing that makes this dangerous. An rclone
+# sync whose source vanishes mid-run will happily make the destination match an
+# empty source -- which is a deletion, not a no-op.
+running=$(pgrep -af 'rclone|cloud-nas|nas0[0-9]-backup|sync-loop' 2>/dev/null | grep -v 'nas-mount-migrate' || true)
+if [[ -n $running ]]; then
+  printf '  sync jobs still running:\n%s\n' "$(printf '%s\n' "$running" | sed 's/^/    /')" >&2
+  if (( force )); then
+    say '  --force given; continuing anyway'
+  else
+    die "refusing to move mountpoints while sync jobs are running.
+  Stop them first (systemctl --user stop ..., tmux kill-session ...), confirm with
+  pgrep -af 'rclone|sync-loop', then re-run."
+  fi
+else
+  say '  ok    no rclone or sync loop running'
+fi
+
+for i in "${!LABELS[@]}"; do
+  mountpoint -q -- "${OLDDIRS[i]}" || die "${OLDDIRS[i]} is not currently mounted; refusing to guess its state"
+done
+say '  ok    every source is mounted'
+
+for i in "${!NEWDIRS[@]}"; do
+  d=${NEWDIRS[i]}
+  if mountpoint -q -- "$d" 2>/dev/null; then die "$d is already a mountpoint"; fi
+  if [[ -d $d && -n $(ls -A -- "$d" 2>/dev/null) ]]; then die "$d already exists and is not empty"; fi
+done
+say '  ok    every target is free'
+
+# Record what is there now, so the move can be proven not to have lost anything.
+declare -a BEFORE=()
+for i in "${!OLDDIRS[@]}"; do
+  BEFORE+=("$(find "${OLDDIRS[i]}" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)")
+done
+say '  ok    recorded top-level entry counts'
+
+if (( dry )); then
+  say ''
+  say 'dry run: nothing was changed.'
+  for i in "${!LABELS[@]}"; do
+    printf '  %s currently holds %s top-level entries\n' "${OLDDIRS[i]}" "${BEFORE[i]}"
+  done
+  exit 0
+fi
+
+# --- do it -------------------------------------------------------------------
+
+STAMP=$(date +%Y%m%dT%H%M%S)
+BACKUP="${FSTAB}.bak-${STAMP}"
+cp -a -- "$FSTAB" "$BACKUP"
+say ''
+say "== applying =="
+say "  fstab backed up to $BACKUP"
+
+# State flags for the unwinder. Rollback has to cope with failing at any point,
+# including after the volumes are unmounted but before they are mounted again --
+# leaving a NAS with its data volumes offline is not an acceptable failure mode.
+COMPLETED=0
+UNMOUNTED=0
+FSTAB_REPLACED=0
+MOUNTED_NEW=0
+
+# trap on EXIT, not ERR: every abort in this script goes through die(), which
+# calls exit, and exit does not fire an ERR trap. An ERR trap here would look
+# correct and never run.
+cleanup() {
+  local rc=$?
+  (( COMPLETED )) && return 0
+
+  printf '\n!! aborting -- rolling back\n' >&2
+
+  if (( FSTAB_REPLACED )); then
+    cp -a -- "$BACKUP" "$FSTAB" && printf '   restored %s from backup\n' "$FSTAB" >&2
+    systemctl daemon-reload 2>/dev/null || true
+    FSTAB_REPLACED=0
+  fi
+
+  if (( MOUNTED_NEW )); then
+    local j
+    for j in "${!NEWDIRS[@]}"; do
+      mountpoint -q -- "${NEWDIRS[j]}" && umount -- "${NEWDIRS[j]}" 2>/dev/null \
+        && printf '   unmounted %s\n' "${NEWDIRS[j]}" >&2
+    done
+    MOUNTED_NEW=0
+  fi
+
+  if (( UNMOUNTED )); then
+    local i failed=0
+    for i in "${!OLDDIRS[@]}"; do
+      install -d -m 0755 -- "${OLDDIRS[i]}" 2>/dev/null || true
+      if mountpoint -q -- "${OLDDIRS[i]}"; then continue; fi
+      if mount -T "$FSTAB" -- "${OLDDIRS[i]}" 2>/dev/null \
+         || mount -L "${LABELS[i]}" -- "${OLDDIRS[i]}" 2>/dev/null; then
+        printf '   remounted %s\n' "${OLDDIRS[i]}" >&2
+      else
+        printf '   COULD NOT REMOUNT %s -- mount it by hand\n' "${OLDDIRS[i]}" >&2
+        failed=1
+      fi
+    done
+    (( failed )) && printf '   try: mount -a\n' >&2
+  fi
+
+  printf '   rollback finished; original fstab is also kept at %s\n' "$BACKUP" >&2
+  exit "$rc"
+}
+trap cleanup EXIT
+
+# Rewrite only the target lines, matching on the exact old mountpoint field.
+tmpf=$(mktemp "${FSTAB}.new.XXXXXX")
+chmod 644 "$tmpf"
+cp -a -- "$FSTAB" "$tmpf"
+for i in "${!LABELS[@]}"; do
+  awk -v old="${OLDDIRS[i]}" -v new="${NEWDIRS[i]}" '
+    /^[[:space:]]*#/ { print; next }
+    { if ($2 == old) { $2 = new }; print }
+  ' OFS='\t' "$tmpf" >"$tmpf.step" && mv -- "$tmpf.step" "$tmpf"
+done
+
+# Create the targets before validating: findmnt --verify reports a missing
+# mountpoint directory as an error, so a not-yet-created target would fail the
+# check every single time.
+for i in "${!NEWDIRS[@]}"; do install -d -m 0755 -- "${NEWDIRS[i]}"; done
+say '  ok    target directories created'
+
+# findmnt --verify parses fstab the way systemd will, and catching a typo here is
+# the difference between a clean abort and a box that will not boot.
+#
+# Compare error COUNTS rather than exit status. A real fstab routinely verifies
+# non-zero for reasons that predate this change -- a removable volume that is not
+# plugged in, a label belonging to a disk in another bay. Aborting on absolute
+# failure would mean never running; what matters is whether the rewrite added
+# anything new.
+errs_before=$(findmnt --verify --tab-file "$FSTAB" 2>&1 | grep -c '\[E\]' || true)
+errs_after=$(findmnt --verify --tab-file "$tmpf" 2>&1 | grep -c '\[E\]' || true)
+if (( errs_after > errs_before )); then
+  printf 'rewritten fstab introduces %d new error(s):\n' "$(( errs_after - errs_before ))" >&2
+  diff <(findmnt --verify --tab-file "$FSTAB" 2>&1) \
+       <(findmnt --verify --tab-file "$tmpf" 2>&1) | sed 's/^/    /' >&2
+  rm -f -- "$tmpf"
+  die 'aborted before touching the live fstab'
+fi
+say "  ok    rewritten fstab adds no new errors (${errs_before} before, ${errs_after} after)"
+
+for i in "${!OLDDIRS[@]}"; do
+  umount -- "${OLDDIRS[i]}" || die "could not unmount ${OLDDIRS[i]} -- something still holds it (check: fuser -vm ${OLDDIRS[i]})"
+  UNMOUNTED=1
+done
+say '  ok    sources unmounted'
+
+mv -- "$tmpf" "$FSTAB"
+FSTAB_REPLACED=1
+systemctl daemon-reload
+say '  ok    fstab replaced, systemd reloaded'
+
+# -T names the table to resolve against. Without it mount always consults
+# /etc/fstab, which silently works in production and breaks every test harness --
+# exactly the asymmetry that hides bugs until the day they matter.
+#
+# And do NOT trust mount's exit status here. These entries carry `nofail`, which
+# is precisely an instruction to succeed quietly when the device is absent: mount
+# returns 0 and mounts nothing. The only trustworthy answer is to ask the kernel
+# afterwards whether something is actually there.
+for i in "${!NEWDIRS[@]}"; do
+  mount -T "$FSTAB" -- "${NEWDIRS[i]}" 2>/dev/null \
+    || mount -L "${LABELS[i]}" -- "${NEWDIRS[i]}" 2>/dev/null \
+    || true
+  MOUNTED_NEW=1
+  mountpoint -q -- "${NEWDIRS[i]}" \
+    || die "${NEWDIRS[i]} is still not mounted after mount(8) reported no error.
+  With nofail set, that is what an absent or unreadable device looks like.
+  Check:  blkid -L ${LABELS[i]}   and   dmesg | tail"
+done
+say '  ok    mounted at the new locations (confirmed by mountpoint, not exit status)'
+
+
+# --- verify ------------------------------------------------------------------
+
+say ''
+say "== verify =="
+fail=0
+for i in "${!LABELS[@]}"; do
+  d=${NEWDIRS[i]}
+  now=$(find "$d" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
+  if mountpoint -q -- "$d" && [[ $now -eq ${BEFORE[i]} ]]; then
+    printf '  ok    %-8s %s  (%s top-level entries, unchanged)\n' "${LABELS[i]}" "$d" "$now"
+  else
+    printf '  FAIL  %-8s %s  (before=%s now=%s mounted=%s)\n' \
+      "${LABELS[i]}" "$d" "${BEFORE[i]}" "$now" "$(mountpoint -q -- "$d" && echo yes || echo no)" >&2
+    fail=1
+  fi
+done
+
+# Verification decides before anything else is discarded: a failure here still has
+# to be able to unwind, and unwinding needs the old mountpoints to still exist.
+if (( fail )); then
+  printf '\nverification failed -- rolling back rather than leaving a half-moved NAS\n' >&2
+  exit 1
+fi
+
+# Only now, with the move proven, remove the old mountpoints. On tmpfs they would
+# reappear empty at boot; deleting them means a stale script still pointing at the
+# old path fails loudly instead of silently writing into RAM.
+for i in "${!OLDDIRS[@]}"; do
+  rmdir -- "${OLDDIRS[i]}" 2>/dev/null || true
+done
+
+COMPLETED=1
+say ''
+say "Done. fstab backup: $BACKUP"
+say ''
+say 'Still to do, by hand:'
+say '  1. update every script and unit that referenced the old paths:'
+printf '       grep -rn %q ~ /etc/systemd 2>/dev/null\n' "$FROM"
+say '  2. restart the sync loops only after that grep comes back clean'
+say "  3. re-verify with: findmnt ${NEWDIRS[*]}"

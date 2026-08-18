@@ -40,8 +40,26 @@ m365_load_conf() {
   : "${M365_TENANT:?M365_TENANT is not set in $M365_CONF}"
   : "${M365_CLIENT_ID:?M365_CLIENT_ID is not set in $M365_CONF}"
   : "${M365_SECRET_FILE:?M365_SECRET_FILE is not set in $M365_CONF}"
-  : "${M365_DEST_ROOT:?M365_DEST_ROOT is not set in $M365_CONF}"
   [[ -r $M365_SECRET_FILE ]] || m365_die "cannot read client secret file: $M365_SECRET_FILE"
+
+  # Destination is composed, never written out literally anywhere in this repo.
+  # Each layer can be overridden on its own -- from the config file, or from the
+  # environment for a one-off run -- so relocating a volume or renaming a share
+  # is a variable change, not a hunt through scripts.
+  #
+  #   M365_DEST_ROOT  =  NAS_MOUNT_BASE / NAS_M365_VOLUME / M365_SUBDIR
+  #
+  # The default lands on NAS_03 deliberately: that volume is the target of the
+  # existing cloud mirror sweep, and whatever lands there is picked up by the
+  # nightly NAS_03 -> NAS_02 snapshot without any further wiring.
+  NAS_MOUNT_BASE="${NAS_MOUNT_BASE:-/srv}"
+  NAS_M365_VOLUME="${NAS_M365_VOLUME:-NAS_03}"
+  M365_SUBDIR="${M365_SUBDIR:-m365}"
+  M365_DEST_ROOT="${M365_DEST_ROOT:-${NAS_MOUNT_BASE}/${NAS_M365_VOLUME}/${M365_SUBDIR}}"
+
+  # The volume itself, as opposed to our subdirectory on it. This is what has to
+  # be a real mountpoint; the subdirectory is ours to create.
+  M365_VOLUME_ROOT="${M365_VOLUME_ROOT:-${NAS_MOUNT_BASE}/${NAS_M365_VOLUME}}"
 
   local mode
   mode=$(stat -c '%a' "$M365_SECRET_FILE")

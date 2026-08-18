@@ -34,9 +34,14 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
-# ProtectSystem=strict makes everything read-only except what is listed here.
-# Edit ReadWritePaths to match M365_DEST_ROOT in m365-backup.conf.
-ReadWritePaths=/volume1/m365-backup /var/lib/m365-backup
+# ProtectSystem=strict makes everything read-only apart from what is listed here.
+# The state directory is fixed, so it lives in the unit. The mirror destination is
+# NOT: it is composed from variables in m365-backup.conf, so scripts/install.sh
+# resolves it and writes the matching ReadWritePaths into
+#   /etc/systemd/system/m365-backup.service.d/destination.conf
+# Re-run install.sh after changing the destination, or the run fails with a
+# permission error that looks nothing like a path problem.
+ReadWritePaths=/var/lib/m365-backup
 
 [Install]
 WantedBy=multi-user.target
