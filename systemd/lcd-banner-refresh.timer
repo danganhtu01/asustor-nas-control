@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh the ASUSTOR front LCD banner shortly after boot
+
+[Timer]
+# Long enough for the boot to have settled on any realistic machine. The banner
+# is already on the panel by then; this only corrects the bottom row.
+OnBootSec=90s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

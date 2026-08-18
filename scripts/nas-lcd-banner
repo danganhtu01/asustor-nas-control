@@ -15,9 +15,14 @@ CONF="${NAS_LCD_CONF:-/etc/nas-lcd/nas-lcd.conf}"
 # shellcheck source=/dev/null
 [[ -r $CONF ]] && . "$CONF"
 
-LCD_PORT="${LCD_PORT:-/dev/ttyS1}"
+# Prefer the udev symlink: it is matched on the port's hardware address, so it
+# survives ttyS renumbering, which is the whole reason the rule exists. Fall
+# back to the bare node for a box where the rule has not been installed yet.
+if [[ -z ${LCD_PORT:-} ]]; then
+  if [[ -e /dev/asustor-lcm ]]; then LCD_PORT=/dev/asustor-lcm; else LCD_PORT=/dev/ttyS1; fi
+fi
 LCD_LINE0="${LCD_LINE0:-$(uname -n)}"
-LCD_LINE1="${LCD_LINE1:-auto}"
+LCD_LINE1="${LCD_LINE1-auto}"
 LCD_RETRY="${LCD_RETRY:-3}"
 LCD_SETTLE="${LCD_SETTLE:-0}"
 
@@ -66,21 +71,40 @@ done
 primary_ip() {
   local ip
   ip=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n 1)
-  [[ -n $ip ]] || ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  # No default route -- an isolated LAN, or a static address with no gateway --
+  # still has an address worth showing. hostname(1) is not on this system, so
+  # the fallback has to come from iproute2 as well.
+  [[ -n $ip ]] || ip=$(ip -4 -o addr show scope global 2>/dev/null |
+                         awk '{split($4, a, "/"); print a[1]; exit}')
   printf '%s' "${ip:-no address}"
 }
 
 boot_line() {
   local state failed
+  # Never block here. This runs inside the boot transaction, and
+  # is-system-running --wait waits for the job queue to drain -- a queue this
+  # unit's own start job is sitting in. It waits on itself, systemd's start
+  # timeout kills it, and the panel gets nothing.
+  #
+  # So: report what is knowable now. During the boot that means "starting", and
+  # the address is the useful thing to show. lcd-banner-refresh.timer runs this
+  # again once the boot has actually settled, from OUTSIDE the transaction,
+  # which is where a degraded boot becomes visible.
+  # Ask the question that is answerable NOW. is-system-running only leaves
+  # "starting" once the job queue drains, and during the boot this unit's own
+  # job is in that queue -- but the failed-unit count is valid at any moment and
+  # returns in milliseconds, so a unit that has ALREADY failed shows up even
+  # from inside the boot. lcd-banner-refresh.timer catches the ones that fail
+  # later.
+  failed=$(systemctl list-units --state=failed --no-legend --plain 2>/dev/null | grep -c . || true)
+  if [[ $failed =~ ^[0-9]+$ ]] && (( failed > 0 )); then
+    printf 'DEGRADED %s fail' "$failed"
+    return
+  fi
   state=$(systemctl is-system-running 2>/dev/null || true)
   case "$state" in
-    running)  primary_ip ;;
-    degraded)
-      failed=$(systemctl list-units --state=failed --no-legend --plain 2>/dev/null | grep -c .)
-      printf 'DEGRADED %s fail' "${failed:-?}"
-      ;;
-    starting|'') primary_ip ;;
-    *)        printf '%s' "$state" ;;
+    running|starting|degraded|'') primary_ip ;;
+    *)                            printf '%s' "$state" ;;
   esac
 }
 
@@ -103,9 +127,11 @@ fi
 [[ -w $LCD_PORT ]] || { printf 'nas-lcd-banner: cannot write %s\n' "$LCD_PORT" >&2; exit 1; }
 
 # The panel runs a fixed ~6s animation after power-on and NAKs everything sent
-# during it (lcm power.go: lcmPowerOnSettleTime). The unit waits; a hand-run
-# does not need to.
-(( LCD_SETTLE > 0 )) && sleep "$LCD_SETTLE"
+# during it (lcm power.go: lcmPowerOnSettleTime). The unit waits on the way up;
+# a hand-run does not need to, and neither does the way down -- the unit's
+# Environment= applies to ExecStop too, and five seconds of dead time on every
+# shutdown buys nothing.
+(( opt_off == 0 && LCD_SETTLE > 0 )) && sleep "$LCD_SETTLE"
 
 stty -F "$LCD_PORT" 115200 raw -echo 2>/dev/null || true
 

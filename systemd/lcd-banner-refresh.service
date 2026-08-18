@@ -1,0 +1,16 @@
+[Unit]
+Description=Refresh the ASUSTOR front LCD banner once the boot has settled
+Documentation=file:///usr/local/share/doc/asustor-nas-control/thermal-and-lcd.md
+# Deliberately NOT WantedBy any boot target. lcd-banner.service writes the panel
+# during the boot, when systemd can only report "starting"; this one runs from a
+# timer, outside the boot transaction, which is the only place
+# `systemctl is-system-running` can answer "degraded". Asking that question from
+# inside the transaction means waiting on a job queue you are yourself holding
+# open.
+ConditionPathExists=|/dev/asustor-lcm
+ConditionPathExists=|/dev/ttyS1
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/nas-lcd-banner
+TimeoutStartSec=30

@@ -6,7 +6,10 @@ Documentation=file:///usr/local/share/doc/asustor-nas-control/thermal-and-lcd.md
 # you would SSH to when it did not.
 After=multi-user.target network-online.target
 Wants=network-online.target
-ConditionPathExists=/dev/ttyS1
+# Either node will do: the udev rule creates the symlink, but the banner still
+# works on a box where the rule has not been installed yet.
+ConditionPathExists=|/dev/asustor-lcm
+ConditionPathExists=|/dev/ttyS1
 
 [Service]
 Type=oneshot
@@ -15,7 +18,16 @@ RemainAfterExit=yes
 # during it. multi-user.target is normally well past that; the settle covers a
 # fast boot, and costs nothing on a slow one.
 Environment=LCD_SETTLE=5
+
+# ExecStop drops the panel's backlight, and nothing in the kernel ever puts it
+# back: power:lcd has trigger "none", so once something writes 0 only userspace
+# restores it. Without this line the first restart -- which the installer itself
+# performs -- leaves a dark panel being written to forever after.
+ExecStartPre=-/bin/sh -c 'echo 1 > /sys/class/leds/power:lcd/brightness'
+
 ExecStart=/usr/local/bin/nas-lcd-banner
+# Can never hang the boot: the banner does no waiting of its own.
+TimeoutStartSec=30
 
 # Blank the panel and drop its backlight on the way down. Without the power
 # cycle the MCU keeps displaying the last message while the box is off -- it

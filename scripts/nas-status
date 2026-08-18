@@ -1135,9 +1135,11 @@ probe_thermal() {
     elif ((THERM[hot_c] >= TEMP_WARN_C)); then worst_at_least 1
     fi
   fi
-  # A fan controller that is installed and not running is the state that put
-  # this box at 80 C in the first place.
-  if [[ ${THERM[fand_load]} == loaded && ${THERM[fand_active]} != active ]]; then
+  # A fan controller that is not regulating is the state that put this box at
+  # 80 C in the first place -- and "masked" or "error" is that state just as
+  # much as "loaded but stopped" is. The only benign case is a machine with no
+  # fan chip at all.
+  if [[ -n ${THERM[chip]} ]] && [[ ${THERM[fand_active]} != active ]]; then
     worst_at_least 1
   fi
   return 0
@@ -1162,20 +1164,18 @@ render_thermal() {
     printf '  %-9s pwm1=%s (%d%%)  %s RPM  %s\n' 'fan' "${THERM[pwm]}" \
       $((THERM[pwm] * 100 / 255)) "${THERM[rpm]:--}" "$mode"
   fi
-  case "${THERM[fand_load]}" in
-    loaded)
-      if [[ ${THERM[fand_active]} == active ]]; then
-        printf '  %-9s %s  active  %s\n' 'control' "$FAND_UNIT" "${THERM[fand_enabled]}"
-      else
-        printf '  %-9s %s%s is %s -- nothing is regulating this fan%s\n' \
-          'control' "$C_YELLOW" "$FAND_UNIT" "${THERM[fand_active]}" "$C_RESET"
-      fi
-      ;;
-    *)
-      printf '  %-9s %sno fan daemon installed; the chip holds whatever PWM it was last given%s\n' \
-        'control' "$C_DIM" "$C_RESET"
-      ;;
-  esac
+  if [[ ${THERM[fand_active]} == active ]]; then
+    printf '  %-9s %s  active  %s\n' 'control' "$FAND_UNIT" "${THERM[fand_enabled]}"
+  elif [[ ${THERM[fand_load]} == loaded ]]; then
+    printf '  %-9s %s%s is %s -- nothing is regulating this fan%s\n' \
+      'control' "$C_YELLOW" "$FAND_UNIT" "${THERM[fand_active]}" "$C_RESET"
+  elif [[ -n ${THERM[chip]} ]]; then
+    # not-found, masked, bad-setting: all of them mean the same thing here.
+    printf '  %-9s %s%s is %s -- nothing is regulating this fan; it holds whatever PWM it was last given%s\n' \
+      'control' "$C_YELLOW" "$FAND_UNIT" "${THERM[fand_load]}" "$C_RESET"
+  else
+    printf '  %-9s %sno fan controller on this machine%s\n' 'control' "$C_DIM" "$C_RESET"
+  fi
 }
 
 # ---------------------------------------------------------------------------

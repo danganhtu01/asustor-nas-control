@@ -17,9 +17,15 @@
 # or to any fixed string.
 #LCD_LINE1=auto
 
-# Serial device. The udev rule also creates /dev/asustor-lcm, which is matched
-# on the hardware address and so survives ttyS renumbering.
+# Serial device. Defaults to /dev/asustor-lcm when the udev rule has created it
+# -- it is matched on the port's hardware address and so survives ttyS
+# renumbering -- and falls back to /dev/ttyS1 otherwise.
 #LCD_PORT=/dev/asustor-lcm
+
+# How long to wait for the boot to settle before deciding what LCD_LINE1=auto
+# should say. This service runs inside the boot transaction, so without the
+# wait systemd always reports "starting" and the degraded case never appears.
+#LCD_BOOT_WAIT=90
 
 # How many times to send each frame. The panel NAKs during early boot and
 # nothing here reads the NAK, so the banner re-sends instead.

@@ -5,6 +5,14 @@ After=multi-user.target
 # No IT87 fan controller, no reason to run.
 ConditionPathExistsGlob=/sys/devices/platform/asustor_it87.*
 
+# Give up after five failures in five minutes rather than restarting forever.
+# Stopping is safe here precisely because ExecStopPost has already driven the
+# fan to full: a permanently failed unit leaves the box loud and obvious, and
+# nas-status reports it, which beats a five-second restart loop nobody reads.
+# These are [Unit] keys; in [Service] systemd ignores them and there is no limit.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=simple
 # Refuse to start on a configuration that would misdrive a fan, rather than

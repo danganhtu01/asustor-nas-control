@@ -119,9 +119,15 @@ fi
 # board ships with no fan curve at all -- manual mode pinned at 20%, with the
 # CPU sitting at 80 C -- and a NAS that boots without fan control is the
 # problem this is meant to fix, not a state to leave someone to opt into.
+#
+# Fan control is set up FIRST and is insulated from everything after it. The
+# LCD is a nicety; the fan is not, and no failure to create a group or reload
+# udev may leave a box running uncooled.
 
 install -Dm644 systemd/nas-fand.service /etc/systemd/system/nas-fand.service
 install -Dm644 systemd/lcd-banner.service /etc/systemd/system/lcd-banner.service
+install -Dm644 systemd/lcd-banner-refresh.service /etc/systemd/system/lcd-banner-refresh.service
+install -Dm644 systemd/lcd-banner-refresh.timer /etc/systemd/system/lcd-banner-refresh.timer
 install -Dm644 systemd/udev/99-asustor-lcm.rules /etc/udev/rules.d/99-asustor-lcm.rules
 
 for conf_pair in "nas-fan:nas-fan.conf" "nas-lcd:nas-lcd.conf"; do
@@ -136,45 +142,69 @@ for conf_pair in "nas-fan:nas-fan.conf" "nas-lcd:nas-lcd.conf"; do
   fi
 done
 
+systemctl daemon-reload 2>/dev/null || true
+
+printf '\nFan control:\n'
+if /usr/local/bin/nas-fand --check >/dev/null 2>&1; then
+  if systemctl enable --now nas-fand.service 2>/dev/null; then
+    # enable --now does not restart a unit that was already running, so an
+    # upgrade would install a new binary and leave the old one regulating.
+    systemctl try-restart nas-fand.service 2>/dev/null || true
+    printf '  nas-fand.service enabled and running the installed build\n'
+  else
+    printf '  could not start nas-fand.service -- systemctl status nas-fand\n'
+  fi
+  sleep 1
+  /usr/local/bin/nas-fand --status 2>/dev/null | sed -n '1,4p;/^hottest/p' | sed 's/^/  /'
+else
+  printf '  nas-fand --check FAILED; NOT enabling. Run it by hand to see why:\n'
+  /usr/local/bin/nas-fand --check 2>&1 | sed 's/^/    /' || true
+fi
+printf '  stopping this service drives the fan to FULL on purpose; see the header of nas-fand\n'
+
+# --- LCD, from here on: nothing below may abort the install ------------------
+
+printf '\nFront LCD:\n'
+
 # A system group, not uucp: uucp would hand over every serial device on the
 # machine, including COM1 and any USB serial adapter plugged in later.
 if ! getent group lcm >/dev/null; then
-  groupadd -r lcm
-  printf '  group lcm  (created)\n'
+  if groupadd -r lcm 2>/dev/null; then
+    printf '  group lcm created\n'
+  else
+    printf '  WARNING: could not create group lcm; the udev rule will not resolve it\n'
+  fi
 fi
-if [[ -n ${SUDO_USER:-} ]] && ! id -nG "$SUDO_USER" | tr ' ' '\n' | grep -qx lcm; then
-  # -a is not optional: without it this replaces every other group the user is
-  # in, wheel included, and takes their sudo with it.
-  usermod -aG lcm "$SUDO_USER"
-  printf '  %s added to group lcm  (log in again, or run: newgrp lcm)\n' "$SUDO_USER"
+if [[ -n ${SUDO_USER:-} ]]; then
+  if id -nG "$SUDO_USER" 2>/dev/null | tr ' ' '\n' | grep -qx lcm; then
+    printf '  %s is already in group lcm\n' "$SUDO_USER"
+  elif usermod -aG lcm "$SUDO_USER" 2>/dev/null; then
+    # -a is not optional: without it this replaces every other group the user
+    # is in, wheel included, and takes their sudo with it.
+    printf '  %s added to group lcm  (log in again, or run: newgrp lcm)\n' "$SUDO_USER"
+  else
+    printf '  WARNING: could not add %s to group lcm\n' "$SUDO_USER"
+  fi
+else
+  printf '  SUDO_USER is unset, so no account was added to group lcm.\n'
+  printf '  To drive the panel as yourself: usermod -aG lcm <user>\n'
 fi
 
 udevadm control --reload-rules 2>/dev/null || true
 udevadm trigger --subsystem-match=tty --action=add 2>/dev/null || true
 
-systemctl daemon-reload 2>/dev/null || true
-
-printf '\nFan control:\n'
-if /usr/local/bin/nas-fand --check >/dev/null 2>&1; then
-  systemctl enable --now nas-fand.service 2>/dev/null \
-    && printf '  nas-fand.service enabled and started\n' \
-    || printf '  could not start nas-fand.service -- systemctl status nas-fand\n'
-  sleep 1
-  /usr/local/bin/nas-fand --status 2>/dev/null | sed -n '1,4p;/^hottest/p' | sed 's/^/  /'
+if [[ -e /dev/asustor-lcm || -e /dev/ttyS1 ]]; then
+  if systemctl enable --now lcd-banner.service 2>/dev/null; then
+    systemctl try-restart lcd-banner.service 2>/dev/null || true
+    systemctl enable --now lcd-banner-refresh.timer 2>/dev/null || true
+    printf '  lcd-banner.service enabled and started\n'
+    printf '  lcd-banner-refresh.timer enabled (re-reads the boot state 90s after boot)\n'
+  else
+    printf '  could not start lcd-banner.service -- systemctl status lcd-banner\n'
+  fi
+  /usr/local/bin/nas-lcd-banner --check 2>/dev/null | sed -n '1,4p' | sed 's/^/  /' || true
 else
-  printf '  nas-fand --check FAILED; not enabling. Run it by hand to see why:\n'
-  /usr/local/bin/nas-fand --check 2>&1 | sed 's/^/    /' || true
-fi
-printf '  stopping this service drives the fan to FULL on purpose; see the header of nas-fand\n'
-
-printf '\nFront LCD:\n'
-if [[ -e /dev/ttyS1 ]]; then
-  systemctl enable --now lcd-banner.service 2>/dev/null \
-    && printf '  lcd-banner.service enabled and started\n' \
-    || printf '  could not start lcd-banner.service -- systemctl status lcd-banner\n'
-  /usr/local/bin/nas-lcd-banner --check 2>/dev/null | sed -n '1,4p' | sed 's/^/  /'
-else
-  printf '  /dev/ttyS1 is absent; skipped\n'
+  printf '  no LCD serial port present; skipped\n'
 fi
 
 printf '\nMicrosoft 365 mirror (read docs/m365-backup.md first):\n'

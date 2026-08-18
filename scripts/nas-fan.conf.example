@@ -29,6 +29,11 @@
 # Seconds between decisions.
 #FAN_INTERVAL=10
 
+# Seconds any single sysfs read may take before it is abandoned. A wedged NVMe
+# or SMBus controller can block one indefinitely, and a control loop parked in
+# a read leaves the fan frozen wherever it happened to be.
+#FAN_READ_TIMEOUT=5
+
 # Which hwmon chips to read, by name, or "auto" for every sensor reporting a
 # plausible temperature. The hottest reading wins, whatever it belongs to --
 # on a NAS a cooking NVMe controller deserves the fan as much as the CPU does.

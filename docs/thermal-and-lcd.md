@@ -16,12 +16,17 @@ Both are installed and **enabled** by `scripts/install.sh`.
 The IT8625 can regulate its own fans from its own thermal inputs. On this board
 those inputs are not connected:
 
-```text
-$ nas-fand --status
-  it8625  temp1  -128 C
-  it8625  temp2  -128 C
-  it8625  temp3  -128 C
+```console
+$ for t in /sys/class/hwmon/hwmon3/temp*_input; do echo "$t $(cat $t)"; done
+/sys/class/hwmon/hwmon3/temp1_input -128000
+/sys/class/hwmon/hwmon3/temp2_input -128000
+/sys/class/hwmon/hwmon3/temp3_input -128000
 ```
+
+(`nas-fand --status` will not show you those rows — it lists only sensors it
+would actually use, and −128 °C is outside the plausibility band. That is the
+point of the band, but it does mean the raw files are where you go to see the
+evidence.)
 
 Handing the chip control would mean regulating against a sensor that does not
 exist, and the safe-looking direction of that failure is the fan idling while
@@ -63,6 +68,20 @@ to have fallen `FAN_HYSTERESIS` degrees (4) below the *peak* seen since the
 level was last changed. Without this the fan audibly oscillates around every
 curve point, which is the most common complaint about fan daemons.
 
+## The refresh timer
+
+`lcd-banner.service` writes the panel during the boot. `lcd-banner-refresh.timer`
+runs the same banner again 90 seconds later, from *outside* the boot
+transaction, and exists for one reason: `systemctl is-system-running` cannot
+answer "degraded" while the boot is still in progress, and a unit that is itself
+part of the boot transaction cannot wait for it to finish — `--wait` blocks on a
+job queue that the waiting unit is holding open. It waits on itself until
+systemd's start timeout kills it, and the panel gets nothing at all.
+
+So the boot-time banner reports what is answerable immediately: the count of
+units already failed, which is valid at any moment, and otherwise the address.
+The timer catches anything that fails after the panel was first written.
+
 `--simulate` replays a sequence of temperatures through the real decision code,
 reading no sensor and writing nothing. It is how the curve and the hysteresis
 are tested, and it is the right way to check a curve change before trusting a
@@ -88,6 +107,30 @@ climb, which is the property that matters for a machine you sit next to.
 Everything is in `/etc/nas-fan/nas-fan.conf`; `scripts/nas-fan.conf.example` is
 the annotated copy.
 
+## What it does when the hardware misbehaves
+
+The daemon assumes nothing about the chip staying where it was put.
+
+- **Every write is verified by reading it back.** A write to sysfs can return
+  success and still not be what the chip ends up holding, and "I told it to" is
+  not the same claim as "it is".
+- **A failed write is not recorded as applied.** Otherwise the next cycle sees
+  nothing to do, and the fan stays exactly as slow as it already was while the
+  log claims a retry is coming.
+- **Drift is re-asserted.** Each cycle reads back the duty and the mode; if
+  something else has moved either — firmware, another tool, a module reload —
+  the daemon says so and puts it back. This box was *found* in mode 0.
+- **The controller is re-resolved if it disappears.** `asustor_it87` can be
+  reloaded, and the hwmon directory number moves when it is.
+- **Sensor reads are bounded** by `FAN_READ_TIMEOUT` (5 s). A wedged NVMe or
+  SMBus controller can block a sysfs read indefinitely, and a control loop
+  parked in `cat(1)` leaves the fan frozen wherever it was.
+- **No usable sensor means full speed**, not "keep the last value".
+
+`FAN_CURVE` is rejected if its duty falls as temperature rises — that is the one
+misconfiguration that actively cooks the machine — and if the temperatures are
+not ascending, if a PWM exceeds 255, or if fewer than two points are given.
+
 ## Stopping the service spins the fan up
 
 Every exit path — clean stop, crash, `SIGKILL`, a config that fails validation —
@@ -97,7 +140,13 @@ The daemon traps its own exit, and `ExecStopPost=/usr/local/bin/nas-fand
 --failsafe` repeats it from the outside for the `SIGKILL` case that never
 reaches a trap. `ExecStartPre=nas-fand --check` means a configuration that would
 misdrive a fan stops the unit from starting rather than being discovered at
-85 °C.
+85 °C — and `--check` genuinely fails on a missing chip, a missing PWM, no
+usable sensor, or a PWM that root cannot write.
+
+`StartLimitIntervalSec=300` / `StartLimitBurst=5` let a permanently broken
+daemon give up rather than restart every five seconds forever. Giving up is safe
+here precisely because `ExecStopPost` has already driven the fan to full: the
+box is left loud and obvious, and `nas-status` reports it.
 
 This is deliberate. A fan daemon that is not running must leave a NAS loud, not
 silent: silence is the failure you find out about when a disk has already died.
@@ -112,7 +161,10 @@ to do with `asustorctl` (which does LEDs, fans and the backlight).
 **The port.** COM2 on the same IT8625 Super I/O as the fan controller — ACPI
 path `\_SB_.PC00.LPCB.SIOI.COM2`, io `0x2F8`, irq 3. On this box that is
 `/dev/ttyS1`, but 32 `ttyS` nodes exist and only three are real UARTs, so the
-udev rule matches on the hardware address instead of the name:
+udev rule matches on the hardware address instead of the name. `LCD_PORT`
+defaults to `/dev/asustor-lcm` when the rule has created it and falls back to
+`/dev/ttyS1` otherwise, so the symlink is actually used rather than merely
+existing:
 
 ```text
 SUBSYSTEM=="tty", KERNEL=="ttyS[0-9]*", ATTR{port}=="0x2F8", ATTR{type}=="4", \
@@ -169,7 +221,14 @@ that just finished:
 
 Top row is `LCD_LINE0`, defaulting to the hostname. Bottom row is `LCD_LINE1`,
 defaulting to `auto`: the address you would SSH to, or — when systemd reports
-the boot as degraded — `DEGRADED n fail`. A front panel that can say "degraded"
+the boot as degraded — `DEGRADED n fail`.
+
+Getting that second case to be reachable takes a little care. The unit is part
+of the boot transaction, so a plain `systemctl is-system-running` answers
+`starting` every time and the degraded branch could never fire. The banner uses
+`is-system-running --wait`, which blocks until the boot actually settles, under
+a `LCD_BOOT_WAIT` timeout (90 s) so a hung unit elsewhere cannot hold the panel
+blank indefinitely. A front panel that can say "degraded"
 is most of the reason to have a front panel on a headless box. Set
 `LCD_LINE1=""` for a blank row, or any fixed string.
 

@@ -21,7 +21,8 @@
 
 set -uo pipefail
 
-readonly NAS_FAND_VERSION='1.0.0'
+readonly NAS_FAND_VERSION='1.1.0'
+readonly SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
 
 CONF="${NAS_FAN_CONF:-/etc/nas-fan/nas-fan.conf}"
 # shellcheck source=/dev/null
@@ -40,6 +41,10 @@ FAN_HYSTERESIS="${FAN_HYSTERESIS:-4}"
 FAN_INTERVAL="${FAN_INTERVAL:-10}"
 FAN_PWM_CHANNEL="${FAN_PWM_CHANNEL:-1}"
 FAN_FAILSAFE_PWM="${FAN_FAILSAFE_PWM:-255}"
+# --failsafe deliberately runs before validate_curve -- an emergency path must
+# not be blocked by the same bad config that caused the emergency -- so this one
+# value is sanitised here rather than there.
+[[ $FAN_FAILSAFE_PWM =~ ^[0-9]+$ ]] && (( FAN_FAILSAFE_PWM <= 255 )) || FAN_FAILSAFE_PWM=255
 # Readings outside this band are not temperatures. The IT8625's own -128 C
 # disconnected inputs are excluded by the floor, with no chip named anywhere.
 FAN_TEMP_MIN_C="${FAN_TEMP_MIN_C:-0}"
@@ -134,6 +139,15 @@ fan_hwmon() {
 
 # --- temperatures -----------------------------------------------------------
 
+FAN_READ_TIMEOUT="${FAN_READ_TIMEOUT:-5}"
+
+# sysfs reads are normally instant, but a wedged NVMe or SMBus controller can
+# block one indefinitely. Everything that reads hardware goes through here so a
+# stuck sensor costs one timeout, not the whole control loop.
+read_sysfs() {
+  timeout "$FAN_READ_TIMEOUT" cat "$1" 2>/dev/null
+}
+
 # Prints "temp_millic<TAB>chip<TAB>label" per usable sensor.
 read_temps() {
   local h name t label v
@@ -147,7 +161,8 @@ read_temps() {
     fi
     for t in "$h"/temp*_input; do
       [[ -e $t ]] || continue
-      v=$(cat "$t" 2>/dev/null) || continue
+      v=$(read_sysfs "$t") || continue
+      [[ -n $v ]] || continue
       [[ $v =~ ^-?[0-9]+$ ]] || continue
       # A disconnected input reports -128000; a sane band excludes it without
       # this script needing to know which chips are wired on which board.
@@ -194,20 +209,25 @@ pwm_for_temp() {   # tempC -> pwm 0..255, linearly interpolated between points
 }
 
 validate_curve() {
-  local point pt pp last=-999 n=0
+  local point pt pp last=-999 last_pwm=0 n=0
   for point in $FAN_CURVE; do
     [[ $point == *:* ]] || die "FAN_CURVE point is not tempC:pwm -- '$point'"
     pt=${point%%:*}; pp=${point##*:}
     [[ $pt =~ ^-?[0-9]+$ ]] || die "FAN_CURVE temperature is not a number -- '$point'"
     [[ $pp =~ ^[0-9]+$ ]]   || die "FAN_CURVE pwm is not a number -- '$point'"
     (( pp <= 255 ))         || die "FAN_CURVE pwm above 255 -- '$point'"
-    (( pt > last ))         || die "FAN_CURVE is not ascending at '$point'"
-    last=$pt; n=$((n + 1))
+    (( pt > last ))         || die "FAN_CURVE temperatures are not ascending at '$point'"
+    (( pp >= last_pwm ))    || die "FAN_CURVE pwm falls as temperature rises at '$point' -- that heats the machine"
+    last=$pt; last_pwm=$pp; n=$((n + 1))
   done
   (( n >= 2 )) || die "FAN_CURVE needs at least two points"
   [[ $FAN_INTERVAL =~ ^[0-9]+$ ]] && (( FAN_INTERVAL > 0 )) || die "FAN_INTERVAL must be a positive number"
   [[ $FAN_HYSTERESIS =~ ^[0-9]+$ ]] || die "FAN_HYSTERESIS must be a number"
   [[ $FAN_CRIT_TEMP =~ ^[0-9]+$ ]] || die "FAN_CRIT_TEMP must be a number"
+  [[ $FAN_TEMP_MIN_C =~ ^-?[0-9]+$ && $FAN_TEMP_MAX_C =~ ^-?[0-9]+$ ]] \
+    || die "FAN_TEMP_MIN_C and FAN_TEMP_MAX_C must be numbers"
+  (( FAN_TEMP_MAX_C > FAN_TEMP_MIN_C )) || die "FAN_TEMP_MAX_C must exceed FAN_TEMP_MIN_C"
+  [[ $FAN_READ_TIMEOUT =~ ^[0-9]+$ ]] && (( FAN_READ_TIMEOUT > 0 )) || die "FAN_READ_TIMEOUT must be positive"
   [[ $FAN_FAILSAFE_PWM =~ ^[0-9]+$ ]] && (( FAN_FAILSAFE_PWM <= 255 )) || die "FAN_FAILSAFE_PWM must be 0-255"
 }
 
@@ -215,17 +235,50 @@ validate_curve() {
 
 HW=''
 FAILSAFE_DONE=0
+
+# Re-resolve the controller if it has gone. asustor_it87 can be reloaded, and
+# the hwmon directory number moves when it is; a path resolved once at start-up
+# then points at nothing and every write silently succeeds into the void.
+hw_refresh() {
+  [[ -n $HW && -e $HW/pwm$FAN_PWM_CHANNEL ]] && return 0
+  local found
+  found=$(fan_hwmon) || return 1
+  [[ -e $found/pwm$FAN_PWM_CHANNEL ]] || return 1
+  [[ $found != "$HW" ]] && log "fan controller moved to ${found}"
+  HW=$found
+  return 0
+}
+
 apply_pwm() {
   local value=$1
+  hw_refresh || return 1
   local pwm="$HW/pwm$FAN_PWM_CHANNEL"
   local enable="$HW/pwm${FAN_PWM_CHANNEL}_enable"
-  [[ -e $pwm ]] || return 1
+
   # 1 = manual. The chip's own mode 2 would regulate from its disconnected
-  # thermal inputs; see the header. A failing redirection is reported by the
-  # shell before the command runs, so the whole thing has to be wrapped -- not
-  # just the command's own stderr -- or an unprivileged run spews sysfs paths.
-  [[ -e $enable ]] && ( printf '1\n' >"$enable" ) 2>/dev/null
-  ( printf '%s\n' "$value" >"$pwm" ) 2>/dev/null
+  # thermal inputs, and mode 0 is full-on and ignores the duty entirely -- this
+  # box was found in mode 0. A failing redirection is reported by the shell
+  # before the command runs, so the whole thing has to be wrapped, not just the
+  # command's own stderr, or an unprivileged run spews sysfs paths.
+  if [[ -e $enable ]]; then
+    ( printf '1\n' >"$enable" ) 2>/dev/null || return 1
+  fi
+  ( printf '%s\n' "$value" >"$pwm" ) 2>/dev/null || return 1
+
+  # Verify. A write to sysfs can return success and still not be what the chip
+  # ends up holding, and "I told it to" is not the same claim as "it is".
+  local back
+  back=$(read_sysfs "$pwm")
+  [[ $back == "$value" ]] || return 1
+  return 0
+}
+
+# What the chip is actually holding right now.
+chip_state() {   # -> "pwm<TAB>enable"
+  hw_refresh || { printf '\t\n'; return 1; }
+  printf '%s\t%s\n' \
+    "$(read_sysfs "$HW/pwm$FAN_PWM_CHANNEL")" \
+    "$(read_sysfs "$HW/pwm${FAN_PWM_CHANNEL}_enable")"
 }
 
 failsafe() {
@@ -284,6 +337,9 @@ if ((opt_check)); then
     if [[ -e $HW/pwm$FAN_PWM_CHANNEL ]]; then
       printf 'pwm       %s%s\n' "$HW/pwm$FAN_PWM_CHANNEL" \
         "$( [[ -w $HW/pwm$FAN_PWM_CHANNEL ]] && printf '  (writable)' || printf '  (NOT writable -- needs root)')"
+      # Not-writable is expected for a human preview and fatal for the daemon.
+      # ExecStartPre runs as root, so this is the case it has to catch.
+      if [[ ${EUID:-$(id -u)} -eq 0 && ! -w $HW/pwm$FAN_PWM_CHANNEL ]]; then rc=1; fi
     else
       printf 'pwm       %s  NOT PRESENT\n' "$HW/pwm$FAN_PWM_CHANNEL"; rc=1
     fi
@@ -355,6 +411,7 @@ fi
 applied_pwm=-1
 applied_temp=-999
 no_sensor_warned=0
+write_failed_warned=0
 
 while true; do
   hot=$(hottest)
@@ -364,8 +421,19 @@ while true; do
       log "no usable temperature sensor; holding the fan at ${FAN_FAILSAFE_PWM}/255"
       no_sensor_warned=1
     fi
-    ((opt_dry == 0)) && apply_pwm "$FAN_FAILSAFE_PWM"
-    applied_pwm=$FAN_FAILSAFE_PWM; applied_temp=999
+    if ((opt_dry == 0)); then
+      if apply_pwm "$FAN_FAILSAFE_PWM"; then
+        applied_pwm=$FAN_FAILSAFE_PWM; applied_temp=999
+      else
+        # Do NOT record it as applied: that would convince the next cycle there
+        # is nothing to do, and the fan would sit wherever it was while this
+        # daemon reported it had gone to full.
+        (( write_failed_warned == 0 )) \
+          && log "FAILED to write the fail-safe speed; retrying every ${FAN_INTERVAL}s until it lands"
+        write_failed_warned=1
+        applied_pwm=-1
+      fi
+    fi
     ((opt_once)) && break
     sleep "$FAN_INTERVAL"; continue
   fi
@@ -394,18 +462,43 @@ while true; do
     apply=1
   fi
 
+  # Writing only when our own decision changes assumes nothing else ever
+  # touches the chip. Firmware, another tool, or a module reload can put it back
+  # into mode 0 or 2 -- this box was FOUND in mode 0 -- and a daemon that never
+  # reads back would hold a stale belief while the fan did as it liked.
+  if ((apply == 0)) && ((opt_dry == 0)); then
+    IFS=$'\t' read -r cur_pwm cur_enable < <(chip_state)
+    if [[ ${cur_enable:-} != 1 ]] || { (( applied_pwm >= 0 )) && [[ ${cur_pwm:-} != "$applied_pwm" ]]; }; then
+      log "chip drifted (pwm=${cur_pwm:--} enable=${cur_enable:--}); re-asserting"
+      apply=1
+      target=$applied_pwm
+      (( target < 0 )) && target=$(pwm_for_temp "$temp")
+      reason='re-assert'
+    fi
+  fi
+
   if ((apply)); then
     if ((opt_dry)); then
       log "would set pwm${FAN_PWM_CHANNEL}=${target} ($(( target * 100 / 255 ))%) -- ${reason}"
+      applied_pwm=$target; applied_temp=$temp
+    elif apply_pwm "$target"; then
+      (( write_failed_warned )) && log "pwm${FAN_PWM_CHANNEL} writes are landing again"
+      write_failed_warned=0
+      log "pwm${FAN_PWM_CHANNEL}=${target} ($(( target * 100 / 255 ))%) -- ${reason}"
+      applied_pwm=$target; applied_temp=$temp
     else
-      if apply_pwm "$target"; then
-        log "pwm${FAN_PWM_CHANNEL}=${target} ($(( target * 100 / 255 ))%) -- ${reason}"
-      else
-        log "FAILED to write pwm${FAN_PWM_CHANNEL}; retrying next cycle"
-      fi
+      # The log used to promise a retry that could never happen: applied_pwm was
+      # updated whether or not the write landed, so the next cycle saw nothing
+      # to do and the fan stayed exactly as slow as it already was.
+      # Forcing applied_pwm below zero is what makes the retry real: it is the
+      # only re-entry condition left once the target is pinned at 255 and can
+      # never rise. Log once, or a persistent fault floods the journal at
+      # FAN_INTERVAL forever.
+      (( write_failed_warned == 0 )) \
+        && log "FAILED to write pwm${FAN_PWM_CHANNEL}; retrying every ${FAN_INTERVAL}s until it lands"
+      write_failed_warned=1
+      applied_pwm=-1
     fi
-    applied_pwm=$target
-    applied_temp=$temp
   elif (( temp > applied_temp )); then
     # Track the peak so hysteresis measures the fall from it, not from the
     # temperature that happened to be current when the level was last changed.
