@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+# Resolve before cd: re-execing "$0" after changing directory only works when
+# the script was invoked from the repository root. From inside scripts/, the
+# relative path no longer points at anything.
+self=$(readlink -f -- "$0")
+cd "$(dirname -- "$self")/.."
 
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-  exec sudo -- "$0" "$@"
+  exec sudo -- "$self" "$@"
 fi
 
 install -Dm755 scripts/asustorctl /usr/local/bin/asustorctl

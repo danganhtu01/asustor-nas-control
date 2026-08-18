@@ -360,6 +360,11 @@ cache_store() {    # path epoch bytes files
     printf '%s\t%s\t%s\t%s\n' "$path" "$2" "$3" "$4"
   } >"$tmp" 2>/dev/null && mv -f -- "$tmp" "$SIZE_CACHE" 2>/dev/null
   rm -f -- "$tmp" 2>/dev/null
+  # Under sudo this file lands in the owning user's home. Left owned by root it
+  # is one they can never rewrite, so their own runs lose the cache permanently.
+  if [[ ${EUID:-$(id -u)} -eq 0 && $NAS_USER != root ]]; then
+    chown "$NAS_USER" -- "$STATE_DIR" "$SIZE_CACHE" 2>/dev/null || true
+  fi
 }
 
 # Sets M_BYTES, M_FILES, M_AGE (seconds since measured, -1 when just taken) and
@@ -390,9 +395,19 @@ measure_dir() {
   [[ $c_epoch =~ ^[0-9]+$ ]] && cache_age=$((now_epoch - c_epoch))
 
   # A previous walk gave up. Do not re-pay the full timeout on every run --
-  # come back to it when the entry ages out like any other.
-  if ((opt_refresh == 0)) && [[ $c_bytes == -1 ]] && ((cache_age >= 0)) && ((cache_age < SIZE_TTL)); then
-    M_STATE='timeout'; M_AGE=$cache_age
+  # come back to it when the marker ages out. The marker lives under a key no
+  # real path can take, so recording a failure never destroys the last good
+  # measurement of the same directory.
+  local failed f_epoch f_age=-1
+  if failed=$(cache_lookup "!timeout!$path"); then
+    f_epoch=${failed%%$'\t'*}
+    [[ $f_epoch =~ ^[0-9]+$ ]] && f_age=$((now_epoch - f_epoch))
+  fi
+  if ((opt_refresh == 0)) && ((f_age >= 0)) && ((f_age < SIZE_TTL)); then
+    M_STATE='timeout'
+    if [[ $c_bytes =~ ^[0-9]+$ ]]; then
+      M_BYTES=$c_bytes; M_FILES=$c_files; M_AGE=$cache_age
+    fi
     return 0
   fi
 
@@ -429,7 +444,7 @@ measure_dir() {
 
   # Walk did not finish in time. A figure from an hour ago beats a dash, and
   # the failure itself is recorded so the next run does not pay for it again.
-  cache_store "$path" "$now_epoch" -1 -1
+  cache_store "!timeout!$path" "$now_epoch" 0 0
   if [[ $c_bytes =~ ^[0-9]+$ ]]; then
     M_BYTES=$c_bytes; M_FILES=$c_files; M_AGE=$cache_age; M_STATE='timeout'
   else
@@ -1394,7 +1409,7 @@ render_job_detail() {
     df)           size_note="  ${C_DIM}(whole volume, from df)${C_RESET}" ;;
     cached|stale) size_note="  ${C_DIM}(measured $(since_human "${JOB[$id.size_age]}"))${C_RESET}" ;;
     partial)      size_note="  ${C_YELLOW}(UNDERCOUNT -- part of the tree was unreadable)${C_RESET}" ;;
-    timeout)      size_note="  ${C_YELLOW}(walk exceeded ${SIZE_TIMEOUT}s${JOB[$id.size_age]:+; figure is $(since_human "${JOB[$id.size_age]}")})${C_RESET}" ;;
+    timeout)      size_note="  ${C_YELLOW}(walk timed out${JOB[$id.size_age]:+; figure measured $(since_human "${JOB[$id.size_age]}")})${C_RESET}" ;;
     *)            size_note='' ;;
   esac
   if [[ -d $dest ]]; then
