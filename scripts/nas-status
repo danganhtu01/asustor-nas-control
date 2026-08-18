@@ -174,7 +174,8 @@ while (($#)); do
     -f|--fast) opt_fast=1 ;;
     --refresh) opt_refresh=1 ;;
     --size-timeout)
-      shift; [[ ${1:-} =~ ^[0-9]+$ ]] || { printf 'nas-status: --size-timeout needs a number\n' >&2; exit 2; }
+      shift; [[ ${1:-} =~ ^[0-9]+$ ]] && (( $1 > 0 )) || {
+        printf 'nas-status: --size-timeout needs a positive number of seconds\n' >&2; exit 2; }
       SIZE_TIMEOUT=$1 ;;
     --job)
       shift; [[ -n ${1:-} ]] || { printf 'nas-status: --job needs an id\n' >&2; exit 2; }
@@ -184,7 +185,10 @@ while (($#)); do
       opt_errors=$1 ;;
     -w|--watch)
       opt_watch=1
-      if [[ ${2:-} =~ ^[0-9]+$ ]]; then opt_watch_interval=$2; shift; fi ;;
+      if [[ ${2:-} =~ ^[0-9]+$ ]]; then
+        (( $2 > 0 )) || { printf 'nas-status: --watch needs a positive interval\n' >&2; exit 2; }
+        opt_watch_interval=$2; shift
+      fi ;;
     --json) opt_json=1 ;;
     --btop) opt_btop=always ;;
     --no-btop) opt_btop=never ;;
@@ -326,11 +330,19 @@ LAST_MATCH_WINDOWS=(2000 40000 400000)
 # actually occupy. -xdev stops a stray bind mount dragging another filesystem in.
 
 measure_path_now() {
-  local path=$1
+  local path=$1 err rc=0
   [[ -d $path ]] || { printf '\t\n'; return 1; }
-  find "$path" -xdev \( -type f -o -type l \) -printf '%i\t%s\n' 2>/dev/null \
+  err=$(mktemp) || err=''
+  find "$path" -xdev \( -type f -o -type l \) -printf '%i\t%s\n' 2>"${err:-/dev/null}" \
     | awk -F'\t' '!seen[$1]++ { bytes += $2; files += 1 }
                   END { printf "%d\t%d\n", bytes, files }'
+  # An unreadable subtree makes the answer an undercount. Say so with an exit
+  # status rather than presenting a short figure as an accurate one.
+  if [[ -n $err ]]; then
+    [[ -s $err ]] && rc=3
+    rm -f -- "$err"
+  fi
+  return $rc
 }
 
 cache_lookup() {   # path -> "epoch<TAB>bytes<TAB>files", empty when absent
@@ -343,7 +355,8 @@ cache_store() {    # path epoch bytes files
   local path=$1 tmp
   mkdir -p -- "$STATE_DIR" 2>/dev/null || return 0
   tmp="$SIZE_CACHE.$$"
-  { [[ -r $SIZE_CACHE ]] && awk -F'\t' -v p="$path" '$1 != p' "$SIZE_CACHE"
+  { [[ -r $SIZE_CACHE ]] && awk -F'\t' -v p="$path" -v cut="$((now_epoch - 2592000))" \
+      '$1 != p && $2 + 0 >= cut' "$SIZE_CACHE"
     printf '%s\t%s\t%s\t%s\n' "$path" "$2" "$3" "$4"
   } >"$tmp" 2>/dev/null && mv -f -- "$tmp" "$SIZE_CACHE" 2>/dev/null
   rm -f -- "$tmp" 2>/dev/null
@@ -376,6 +389,13 @@ measure_dir() {
   local cache_age=-1
   [[ $c_epoch =~ ^[0-9]+$ ]] && cache_age=$((now_epoch - c_epoch))
 
+  # A previous walk gave up. Do not re-pay the full timeout on every run --
+  # come back to it when the entry ages out like any other.
+  if ((opt_refresh == 0)) && [[ $c_bytes == -1 ]] && ((cache_age >= 0)) && ((cache_age < SIZE_TTL)); then
+    M_STATE='timeout'; M_AGE=$cache_age
+    return 0
+  fi
+
   # Fresh enough, or the caller asked us never to walk a tree.
   if ((opt_refresh == 0)) && [[ $c_bytes =~ ^[0-9]+$ ]] \
      && { ((opt_fast)) || { ((cache_age >= 0)) && ((cache_age < SIZE_TTL)); }; }; then
@@ -388,19 +408,28 @@ measure_dir() {
     return 0
   fi
 
+  local rc=0
   if [[ -x $SELF ]]; then
-    out=$(timeout "$SIZE_TIMEOUT" "$SELF" --measure-path "$path" 2>/dev/null)
+    out=$(timeout "$SIZE_TIMEOUT" "$SELF" --measure-path "$path" 2>/dev/null) || rc=$?
   else
-    out=$(timeout "$SIZE_TIMEOUT" "${BASH:-bash}" "$SELF" --measure-path "$path" 2>/dev/null)
+    out=$(timeout "$SIZE_TIMEOUT" "${BASH:-bash}" "$SELF" --measure-path "$path" 2>/dev/null) || rc=$?
   fi
   if [[ $out =~ ^[0-9]+$'\t'[0-9]+$ ]]; then
     IFS=$'\t' read -r M_BYTES M_FILES <<<"$out"
-    M_AGE=0; M_STATE='fresh'
-    cache_store "$path" "$now_epoch" "$M_BYTES" "$M_FILES"
+    M_AGE=0
+    if ((rc == 3)); then
+      # Partial: real numbers, but an undercount. Never cached as if complete.
+      M_STATE='partial'
+    else
+      M_STATE='fresh'
+      cache_store "$path" "$now_epoch" "$M_BYTES" "$M_FILES"
+    fi
     return 0
   fi
 
-  # Walk did not finish in time. A figure from an hour ago beats a dash.
+  # Walk did not finish in time. A figure from an hour ago beats a dash, and
+  # the failure itself is recorded so the next run does not pay for it again.
+  cache_store "$path" "$now_epoch" -1 -1
   if [[ $c_bytes =~ ^[0-9]+$ ]]; then
     M_BYTES=$c_bytes; M_FILES=$c_files; M_AGE=$cache_age; M_STATE='timeout'
   else
@@ -625,6 +654,26 @@ parse_job_log() {
       : # filled in by probe_job from systemd itself
       ;;
   esac
+
+  # Every loop script announces its own aborts as "[stamp] ERROR: ...". Those
+  # cycles never reach an end marker, so without this a job that has been
+  # refusing to sync for a week still reports the last GOOD cycle as its last
+  # result -- ok, and hours stale. rclone's own "ERROR :" lines carry no
+  # bracketed stamp and are deliberately not matched here.
+  if [[ $parser == rclone-loop || $parser == tenant-loop || $parser == snapshot-loop ]]; then
+    local abort abort_epoch
+    abort=$(last_match "$log" '^\[[^]]*\] ERROR: ')
+    if [[ -n $abort ]]; then
+      abort_epoch=$(line_epoch "$abort")
+      if [[ $abort_epoch =~ ^[0-9]+$ ]] \
+         && { [[ ! $J_LAST_END =~ ^[0-9]+$ ]] || ((abort_epoch > J_LAST_END)); }; then
+        J_RESULT='failed'
+        J_LAST_END=$abort_epoch
+        J_DETAIL=$(printf '%s' "$abort" | sed -n 's/^\[[^]]*\] ERROR: //p')
+        J_DETAIL=${J_DETAIL:0:90}
+      fi
+    fi
+  fi
 }
 
 recent_errors() {   # log n -> up to n recent error lines, newest last
@@ -656,8 +705,19 @@ discover_volumes() {
                     sub(/^LABEL=/, "", $1); print $1 "\t" $2 }' /etc/fstab)
   fi
 
-  # Anything a job writes to counts as a volume even if fstab has not caught up.
-  local rec2 id title scope unit window parser every sched log source dest lock procpat vol
+  # The fstab sweep is filtered by the label glob; a volume a job actually
+  # writes to is a volume by construction and is never filtered out, or the
+  # "writing to the OS disk" alarm would go silent for exactly the destination
+  # somebody had just relocated.
+  local keep=() rec2
+  for rec in "${found[@]}"; do
+    label=${rec%%$'\t'*}
+    # shellcheck disable=SC2053  # deliberate glob match
+    [[ $label == $NAS_VOLUME_GLOB ]] && keep+=("$rec")
+  done
+  found=("${keep[@]}")
+
+  local id title scope unit window parser every sched log source dest lock procpat vol
   for rec2 in "${NAS_JOBS[@]}"; do
     IFS='|' read -r id title scope unit window parser every sched log source dest lock procpat <<<"$rec2"
     for vol in "$dest" "$source"; do
@@ -667,48 +727,68 @@ discover_volumes() {
     done
   done
 
-  printf '%s\n' "${found[@]}" | sort -u | while IFS=$'\t' read -r label mp; do
+  ((${#found[@]})) || return 0
+  printf '%s\n' "${found[@]}" | sort -u -t$'\t' -k2,2 | while IFS=$'\t' read -r label mp; do
     [[ -n $label && -n $mp ]] || continue
-    # shellcheck disable=SC2053  # deliberate glob match
-    [[ $label == $NAS_VOLUME_GLOB ]] || continue
     printf '%s\t%s\n' "$label" "$mp"
   done
+}
+
+# Which known volume encloses this path: the longest mountpoint that prefixes
+# it. "$NAS_MOUNT_BASE/<first component>" was an assumption that the directory
+# is named for its label, and it is not one this tool gets to make.
+volume_for() {
+  local path=$1 best='' mp
+  [[ -n $path ]] || return 0
+  for mp in "${VOL_ORDER[@]}"; do
+    [[ $path == "$mp" || $path == "$mp"/* ]] || continue
+    ((${#mp} > ${#best})) && best=$mp
+  done
+  printf '%s' "$best"
 }
 
 probe_volumes() {
   local label mp src fstype dfline size used avail pct
   while IFS=$'\t' read -r label mp; do
-    [[ -n $label ]] || continue
-    VOL_ORDER+=("$label")
-    VOL["$label.mount"]=$mp
-    VOL["$label.state"]='absent'
-    VOL["$label.device"]='-'
-    VOL["$label.fstype"]='-'
-    VOL["$label.size"]=''; VOL["$label.used"]=''; VOL["$label.avail"]=''; VOL["$label.pct"]='-'
-    VOL["$label.shadow"]=0
+    [[ -n $mp ]] || continue
+    # Keyed by mountpoint: it is the only thing that is actually unique.
+    VOL_ORDER+=("$mp")
+    label=${label:-$mp}
+    VOL["$mp.label"]=$label
+    local key=$mp
+    VOL["$key.mount"]=$mp
+    VOL["$key.state"]='absent'
+    VOL["$key.device"]='-'
+    VOL["$key.fstype"]='-'
+    VOL["$key.size"]=''; VOL["$key.used"]=''; VOL["$key.avail"]=''; VOL["$key.pct"]='-'
+    VOL["$key.shadow"]=0
 
     if IFS=' ' read -r src fstype < <(findmnt -rno SOURCE,FSTYPE -- "$mp" 2>/dev/null); then
-      VOL["$label.state"]='mounted'
-      VOL["$label.device"]=${src:--}
-      VOL["$label.fstype"]=${fstype:--}
+      VOL["$key.state"]='mounted'
+      VOL["$key.device"]=${src:--}
+      VOL["$key.fstype"]=${fstype:--}
       dfline=$(df -B1 --output=size,used,avail,pcent -- "$mp" 2>/dev/null | tail -n 1)
       read -r size used avail pct <<<"$dfline"
-      VOL["$label.size"]=${size:-}; VOL["$label.used"]=${used:-}
-      VOL["$label.avail"]=${avail:-}; VOL["$label.pct"]=${pct:--}
+      VOL["$key.size"]=${size:-}; VOL["$key.used"]=${used:-}
+      VOL["$key.avail"]=${avail:-}; VOL["$key.pct"]=${pct:--}
     elif [[ -d $mp ]]; then
       # The dangerous state, and the reason this section exists at all: an
       # unmounted mountpoint is an ordinary directory on the OS disk. A sync
       # aimed at it fills the root filesystem instead of the array.
-      VOL["$label.state"]='NOT MOUNTED'
-      [[ -n $(ls -A -- "$mp" 2>/dev/null) ]] && VOL["$label.shadow"]=1
+      VOL["$key.state"]='NOT MOUNTED'
+      [[ -n $(ls -A -- "$mp" 2>/dev/null) ]] && VOL["$key.shadow"]=1
     else
-      VOL["$label.state"]='missing'
+      VOL["$key.state"]='missing'
+    fi
+
+    if [[ ${VOL[$key.state]} != mounted ]]; then
+      worst_at_least 2
     fi
 
     if [[ -e /dev/disk/by-label/$label ]]; then
-      VOL["$label.byLabel"]=$(readlink -f -- "/dev/disk/by-label/$label" 2>/dev/null)
+      VOL["$key.byLabel"]=$(readlink -f -- "/dev/disk/by-label/$label" 2>/dev/null)
     else
-      VOL["$label.byLabel"]=''
+      VOL["$key.byLabel"]=''
     fi
   done < <(discover_volumes)
 }
@@ -722,6 +802,14 @@ JOB_ORDER=()
 WORST=0
 
 worst_at_least() { (($1 > WORST)) && WORST=$1; return 0; }
+
+known_job_ids() {
+  local rec id
+  for rec in "${NAS_JOBS[@]}"; do
+    IFS='|' read -r id _ <<<"$rec"
+    [[ -n $id ]] && printf '%s ' "$id"
+  done
+}
 
 job_selected() {
   local id=$1
@@ -819,6 +907,17 @@ probe_jobs() {
     fi
     [[ -n $pids && -z $running_since && ${J_LAST_START:-} =~ ^[0-9]+$ ]] && running_since=$J_LAST_START
 
+    # ... unless it plainly is not. A cycle whose start was logged, whose end
+    # never was, and which has no process behind it, did not survive: the loop
+    # was killed, or the whole tmux server went down mid-transfer. Reporting
+    # RUNNING for that forever is the opposite of what a status command is for.
+    local stalled=0 stale_after
+    stale_after=$(( ${every:-3600} * 3 ))
+    ((stale_after < 3600)) && stale_after=3600
+    if [[ -n $running_since && -z $pids ]] && ((now_epoch - running_since > stale_after)); then
+      stalled=1
+    fi
+
     # While a cycle runs, the next-run time computed from the previous one is
     # already in the past. Showing it as "45m ago" is worse than saying nothing.
     if [[ -n $running_since && ${J_NEXT:-} =~ ^[0-9]+$ ]] && ((J_NEXT <= now_epoch)); then
@@ -831,6 +930,7 @@ probe_jobs() {
     JOB["$id.detail"]=$J_DETAIL
     JOB["$id.next"]=$J_NEXT
     JOB["$id.running_since"]=$running_since
+    JOB["$id.stalled"]=$stalled
 
     # Destination size
     measure_dir "$dest"
@@ -869,6 +969,8 @@ probe_jobs() {
     elif [[ ${JOB[$id.window_up]} == 0 ]]; then
       # The unit is only a babysitter; the tmux window is where work happens.
       state='NO WORKER'; sev=1
+    elif ((stalled)); then
+      state='STALLED'; sev=1
     elif [[ -n $pids || -n $running_since ]]; then
       state='RUNNING'
     else
@@ -878,12 +980,10 @@ probe_jobs() {
     [[ ${JOB[$id.result]} == failed ]] && sev=1
 
     # A destination on an unmounted volume is the one thing worth shouting about.
-    local vol=''
-    if [[ $dest == "$NAS_MOUNT_BASE"/* ]]; then
-      vol=${dest#"$NAS_MOUNT_BASE"/}; vol=${vol%%/*}
-      if [[ -n ${VOL[$vol.state]:-} && ${VOL[$vol.state]} != mounted && $scope != none ]]; then
-        state='DEST UNMOUNTED'; sev=2
-      fi
+    local vol
+    vol=$(volume_for "$dest")
+    if [[ -n $vol && ${VOL[$vol.state]} != mounted && $scope != none ]]; then
+      state='DEST UNMOUNTED'; sev=2
     fi
     JOB["$id.volume"]=$vol
     JOB["$id.state"]=$state
@@ -897,7 +997,7 @@ state_color() {
     IDLE|SCHEDULED)              printf '%s' "$C_GREEN" ;;
     RUNNING)                     printf '%s' "$C_CYAN" ;;
     DEST\ UNMOUNTED)             printf '%s' "$C_RED" ;;
-    STOPPED|NO\ UNIT|NO\ WORKER) printf '%s' "$C_YELLOW" ;;
+    STOPPED|NO\ UNIT|NO\ WORKER|STALLED) printf '%s' "$C_YELLOW" ;;
     *)                           printf '%s' "$C_DIM" ;;
   esac
 }
@@ -942,6 +1042,11 @@ probe_snapshots() {
   SNAP[incomplete]=$(find "$SNAPSHOT_ROOT" -mindepth 1 -maxdepth 1 -type d \
                        -name '*.incomplete' -printf '%f ' 2>/dev/null)
   SNAP[avail]=$(df -B1 --output=avail -- "$SNAPSHOT_ROOT" 2>/dev/null | tail -n 1 | tr -d ' ')
+  if [[ ${SNAP[avail]} =~ ^[0-9]+$ ]] && ((SNAP[avail] < SNAP[reserve])); then
+    worst_at_least 1
+  fi
+  [[ -n ${SNAP[incomplete]// /} ]] && worst_at_least 1
+  return 0
 }
 
 snapshot_epoch() {   # 202608190330_NAS_03_backup -> epoch
@@ -966,9 +1071,9 @@ probe_remotes() {
   local remote rec id rest source owner
   local -a names=()
   if [[ ${EUID:-$(id -u)} -eq 0 && $NAS_USER != root ]]; then
-    mapfile -t names < <(as_nas_user rclone listremotes 2>/dev/null)
+    mapfile -t names < <(as_nas_user rclone listremotes </dev/null 2>/dev/null)
   else
-    mapfile -t names < <(rclone listremotes 2>/dev/null)
+    mapfile -t names < <(rclone listremotes </dev/null 2>/dev/null)
   fi
   for remote in "${names[@]}"; do
     remote=${remote%:}
@@ -1024,14 +1129,25 @@ probe_extra_units() {
   done
 
   local scope_name pat line name load active
+  # Word-split the pattern lists, but do NOT let the shell pathname-expand them:
+  # "*sync*" against a directory that happens to hold a file called sync-notes
+  # silently rewrites the unit filter.
+  local -a patterns ignores
+  set -f
+  # shellcheck disable=SC2206
+  patterns=($DISCOVER_PATTERNS)
+  # shellcheck disable=SC2206
+  ignores=($DISCOVER_IGNORE)
+  set +f
+
   for scope_name in user system; do
-    for pat in $DISCOVER_PATTERNS; do
+    for pat in "${patterns[@]}"; do
       while read -r name load active _; do
         [[ -n $name ]] || continue
         [[ $name == *.service || $name == *.timer ]] || continue
         [[ $known == *" $name "* ]] && continue
         local skip=0 ig
-        for ig in $DISCOVER_IGNORE; do
+        for ig in "${ignores[@]}"; do
           # shellcheck disable=SC2053  # deliberate glob match
           [[ $name == $ig ]] && { skip=1; break; }
         done
@@ -1051,9 +1167,13 @@ probe_extra_units() {
 # Strictly idempotent: the pane is named, and a named pane that already exists
 # is left alone. Running nas-status in a loop must never stack btop instances.
 
+# 0 = the pane is there, 1 = it is not, 2 = could not tell.
+# The difference between 1 and 2 matters: treating "could not tell" as "not
+# there" is how a status command ends up opening a second btop every run.
 btop_pane_exists() {
   local layout
-  layout=$(zellij_cmd action dump-layout 2>/dev/null) || return 1
+  layout=$(zellij_cmd action dump-layout 2>/dev/null) || return 2
+  [[ -n $layout ]] || return 2
   [[ $layout == *"name=\"$BTOP_PANE_NAME\""* ]]
 }
 
@@ -1101,10 +1221,13 @@ ensure_btop_pane() {
     fi
   fi
 
-  if btop_pane_exists; then
-    BTOP_NOTE="pane '$BTOP_PANE_NAME' already open in zellij session '$ZJ_SESSION'"
-    return 0
-  fi
+  btop_pane_exists
+  case $? in
+    0) BTOP_NOTE="pane '$BTOP_PANE_NAME' already open in zellij session '$ZJ_SESSION'"
+       return 0 ;;
+    2) BTOP_NOTE="could not read the layout of zellij session '$ZJ_SESSION'; not opening a pane"
+       return 0 ;;
+  esac
 
   local -a args=(action new-pane --name "$BTOP_PANE_NAME" --close-on-exit)
   [[ ${opt_btop_floating:-0} == 1 ]] && args+=(--floating)
@@ -1145,9 +1268,10 @@ render_volumes() {
   section 'VOLUMES'
   printf '%-9s %-13s %-15s %10s %10s %10s %5s  %s\n' \
     'VOLUME' 'STATE' 'DEVICE' 'SIZE' 'USED' 'FREE' 'USE%' 'MOUNTPOINT'
-  local label state color
-  for label in "${VOL_ORDER[@]}"; do
-    state=${VOL[$label.state]}
+  local key label state color
+  for key in "${VOL_ORDER[@]}"; do
+    label=${VOL[$key.label]}
+    state=${VOL[$key.state]}
     case "$state" in
       mounted) color=$C_GREEN ;;
       'NOT MOUNTED') color=$C_RED ;;
@@ -1156,20 +1280,18 @@ render_volumes() {
     printf '%-9s ' "$label"
     padcolor "$state" 13 "$color"
     printf ' %-15s %10s %10s %10s %5s  %s\n' \
-      "${VOL[$label.device]}" \
-      "$(human "${VOL[$label.size]:-}")" \
-      "$(human "${VOL[$label.used]:-}")" \
-      "$(human "${VOL[$label.avail]:-}")" \
-      "${VOL[$label.pct]}" \
-      "${VOL[$label.mount]}"
-    if [[ ${VOL[$label.shadow]} == 1 ]]; then
+      "${VOL[$key.device]}" \
+      "$(human "${VOL[$key.size]:-}")" \
+      "$(human "${VOL[$key.used]:-}")" \
+      "$(human "${VOL[$key.avail]:-}")" \
+      "${VOL[$key.pct]}" \
+      "${VOL[$key.mount]}"
+    if [[ ${VOL[$key.shadow]} == 1 ]]; then
       printf '  %s!! %s is not mounted but its directory holds data -- that data is on the OS disk%s\n' \
-        "$C_RED" "${VOL[$label.mount]}" "$C_RESET"
-      worst_at_least 2
+        "$C_RED" "${VOL[$key.mount]}" "$C_RESET"
     elif [[ $state == 'NOT MOUNTED' || $state == missing ]]; then
       printf '  %s!! %s is not mounted%s%s\n' "$C_RED" "$label" \
-        "${VOL[$label.byLabel]:+ (device present at ${VOL[$label.byLabel]})}" "$C_RESET"
-      worst_at_least 2
+        "${VOL[$key.byLabel]:+ (device present at ${VOL[$key.byLabel]})}" "$C_RESET"
     fi
   done
 }
@@ -1188,7 +1310,10 @@ render_job_summary() {
     padcolor "$result" 9 "$(result_color "$result")"
     printf ' %-20s ' "$(stamp_or_dash "${JOB[$id.last_end]}")"
     next=${JOB[$id.next]}
-    if [[ $next =~ ^[0-9]+$ ]]; then
+    if [[ $next =~ ^[0-9]+$ ]] && ((next <= now_epoch)); then
+      printf '%s%s  overdue %s%s\n' "$C_YELLOW" "$(date -d "@$next" '+%H:%M')" \
+        "$(since_human $((now_epoch - next)) | sed 's/ ago$//')" "$C_RESET"
+    elif [[ $next =~ ^[0-9]+$ ]]; then
       printf '%s  %s\n' "$(date -d "@$next" '+%H:%M')" "$(since_human $((now_epoch - next)))"
     elif [[ -n ${JOB[$id.running_since]} ]]; then
       printf 'after this cycle\n'
@@ -1237,7 +1362,11 @@ render_job_detail() {
 
   local rs=${JOB[$id.running_since]}
   if [[ $rs =~ ^[0-9]+$ ]]; then
-    kv 'running' "since $(date -d "@$rs" '+%H:%M:%S'), $(duration_human $((now_epoch - rs))) elapsed"
+    if [[ ${JOB[$id.stalled]} == 1 ]]; then
+      kv 'stalled' "started $(date -d "@$rs" '+%F %H:%M:%S'), never finished, no process running"
+    else
+      kv 'running' "since $(date -d "@$rs" '+%H:%M:%S'), $(duration_human $((now_epoch - rs))) elapsed"
+    fi
   fi
 
   if [[ ${JOB[$id.last_end]} =~ ^[0-9]+$ ]]; then
@@ -1253,7 +1382,9 @@ render_job_detail() {
     kv 'last run' 'no completed cycle in the log'
   fi
 
-  if [[ ${JOB[$id.next]} =~ ^[0-9]+$ ]]; then
+  if [[ ${JOB[$id.next]} =~ ^[0-9]+$ ]] && ((JOB[$id.next] <= now_epoch)); then
+    kv 'next run' "$(date -d "@${JOB[$id.next]}" '+%F %H:%M:%S')  ${C_YELLOW}overdue $(since_human $((now_epoch - JOB[$id.next])) | sed 's/ ago$//')${C_RESET}"
+  elif [[ ${JOB[$id.next]} =~ ^[0-9]+$ ]]; then
     kv 'next run' "$(date -d "@${JOB[$id.next]}" '+%F %H:%M:%S')  $(since_human $((now_epoch - JOB[$id.next])))"
   elif [[ -n $rs ]]; then
     kv 'next run' 'after this cycle'
@@ -1262,6 +1393,7 @@ render_job_detail() {
   case "${JOB[$id.size_state]}" in
     df)           size_note="  ${C_DIM}(whole volume, from df)${C_RESET}" ;;
     cached|stale) size_note="  ${C_DIM}(measured $(since_human "${JOB[$id.size_age]}"))${C_RESET}" ;;
+    partial)      size_note="  ${C_YELLOW}(UNDERCOUNT -- part of the tree was unreadable)${C_RESET}" ;;
     timeout)      size_note="  ${C_YELLOW}(walk exceeded ${SIZE_TIMEOUT}s${JOB[$id.size_age]:+; figure is $(since_human "${JOB[$id.size_age]}")})${C_RESET}" ;;
     *)            size_note='' ;;
   esac
@@ -1323,7 +1455,6 @@ render_snapshots() {
     if ((SNAP[avail] < SNAP[reserve])); then
       printf '  %-9s %s%s free, below the %s reserve -- the next run prunes the oldest%s\n' \
         'free' "$C_YELLOW" "$(human "${SNAP[avail]}")" "$(human "${SNAP[reserve]}")" "$C_RESET"
-      worst_at_least 1
     else
       kv 'free' "$(human "${SNAP[avail]}")  (reserve $(human "${SNAP[reserve]}"))"
     fi
@@ -1361,7 +1492,7 @@ render_footer() {
 jnum() { [[ ${1:-} =~ ^-?[0-9]+$ ]] && printf '%s' "$1" || printf 'null'; }
 
 render_json() {
-  local jobs_json vols_json extra_json id label e scope name load active
+  local jobs_json vols_json extra_json id key e scope name load active
 
   jobs_json=$(
     for id in "${JOB_ORDER[@]}"; do
@@ -1409,18 +1540,18 @@ render_json() {
   )
 
   vols_json=$(
-    for label in "${VOL_ORDER[@]}"; do
+    for key in "${VOL_ORDER[@]}"; do
       jq -n \
-        --arg label "$label" \
-        --arg mountpoint "${VOL[$label.mount]}" \
-        --arg state "${VOL[$label.state]}" \
-        --arg device "${VOL[$label.device]}" \
-        --arg fstype "${VOL[$label.fstype]}" \
-        --arg pct "${VOL[$label.pct]}" \
-        --argjson shadowed "$( [[ ${VOL[$label.shadow]} == 1 ]] && printf true || printf false )" \
-        --argjson size "$(jnum "${VOL[$label.size]}")" \
-        --argjson used "$(jnum "${VOL[$label.used]}")" \
-        --argjson avail "$(jnum "${VOL[$label.avail]}")" \
+        --arg label "${VOL[$key.label]}" \
+        --arg mountpoint "${VOL[$key.mount]}" \
+        --arg state "${VOL[$key.state]}" \
+        --arg device "${VOL[$key.device]}" \
+        --arg fstype "${VOL[$key.fstype]}" \
+        --arg pct "${VOL[$key.pct]}" \
+        --argjson shadowed "$( [[ ${VOL[$key.shadow]} == 1 ]] && printf true || printf false )" \
+        --argjson size "$(jnum "${VOL[$key.size]}")" \
+        --argjson used "$(jnum "${VOL[$key.used]}")" \
+        --argjson avail "$(jnum "${VOL[$key.avail]}")" \
         '{label: $label, mountpoint: $mountpoint, state: $state, device: $device,
           fstype: $fstype, size: $size, used: $used, available: $avail,
           use_percent: $pct, shadowing_root_filesystem: $shadowed}'
@@ -1523,9 +1654,13 @@ main() {
     while true; do
       collect
       ensure_btop_pane
-      printf '\033[H\033[2J'
-      render_text
-      printf '\n%s(refreshing every %ss -- Ctrl-C to stop)%s\n' "$C_DIM" "$opt_watch_interval" "$C_RESET"
+      if ((opt_json)); then
+        render_json
+      else
+        printf '\033[H\033[2J'
+        render_text
+        printf '\n%s(refreshing every %ss -- Ctrl-C to stop)%s\n' "$C_DIM" "$opt_watch_interval" "$C_RESET"
+      fi
       # Only the first pass pays for a directory walk; a watch loop that
       # re-walked 700 GiB every 30 seconds would be a denial of service on the
       # thing it is meant to be watching.
@@ -1535,6 +1670,11 @@ main() {
   fi
 
   collect
+  if [[ -n $opt_job ]] && ((${#JOB_ORDER[@]} == 0)); then
+    printf 'nas-status: no job matches: %s\n' "$opt_job" >&2
+    printf 'known jobs: %s\n' "$(known_job_ids)" >&2
+    exit 2
+  fi
   ensure_btop_pane
   if ((opt_json)); then
     render_json

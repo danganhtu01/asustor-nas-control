@@ -45,6 +45,7 @@ cycle — and collapsing that into one word loses the half you needed.
 | --- | --- |
 | `RUNNING` | a cycle is in flight (an rclone process, or a start with no end logged) |
 | `IDLE` | alive and waiting for its next scheduled cycle |
+| `STALLED` | a cycle started, never logged an end, and no process is behind it |
 | `SCHEDULED` | a systemd timer, enabled, waiting |
 | `DISABLED` | a timer that exists but is not enabled |
 | `STOPPED` | the unit is not active |
@@ -52,6 +53,16 @@ cycle — and collapsing that into one word loses the half you needed.
 | `NO UNIT` | the registry names a unit that is not installed |
 | `NO JOB` | a destination directory with nothing configured to refresh it |
 | `DEST UNMOUNTED` | the destination's volume is not mounted |
+
+`STALLED` is the other one. A cycle whose start was logged, whose end never
+was, and which has no rclone process behind it did not survive — the loop was
+killed, or the tmux server went down mid-transfer. Without a distinct state that
+job reads as `RUNNING` forever.
+
+An aborted cycle is also caught in the `LAST` column. Every loop script
+announces its own aborts as `[stamp] ERROR: …`, and such a line newer than the
+last completed cycle is reported as that job's last result. Otherwise a job that
+has been refusing to sync for a week still shows the last *good* cycle as `ok`.
 
 `NO WORKER` is the one worth understanding. These jobs are a systemd user unit
 babysitting a tmux window; the unit stays green whether or not the window
@@ -89,6 +100,30 @@ nas-status --fast              # cache only, never walk anything
 nas-status --refresh           # ignore the TTL, re-measure everything
 nas-status --size-timeout 120  # allow a long cold walk
 ```
+
+A walk that gives up records the failure, so the next run does not pay the full
+timeout again — it retries when the entry ages out. A walk that could not read
+part of the tree is labelled `UNDERCOUNT` and is never cached, because a short
+figure presented as an accurate one is worse than no figure.
+
+## Options
+
+| flag | meaning |
+| --- | --- |
+| `-f`, `--fast` | never walk a directory; cached sizes only |
+| `--refresh` | re-measure everything, ignoring the cache TTL |
+| `--size-timeout N` | give up on one measurement after N seconds (default 25) |
+| `--job ID` | report only this job; repeatable, or a comma list. An id that matches nothing is an error, not an all-clear |
+| `-e`, `--errors N` | N recent error lines per job (default 3, `0` = none) |
+| `-w`, `--watch [N]` | redraw every N seconds (default 30); walks once, then holds |
+| `--json` | the whole report as JSON; composes with `--watch` |
+| `--btop` | open the btop pane even from outside zellij |
+| `--no-btop` | never touch zellij |
+| `--btop-floating` | floating pane rather than tiled |
+| `--color WHEN` | `auto`, `always` or `never` (`--no-color` is accepted too) |
+| `-b`, `--brief` | the volume, job, snapshot and remote tables without the per-job detail blocks |
+| `-V`, `--version` | print the version |
+| `-h`, `--help` | usage |
 
 `--watch` walks once and then holds the figures: a loop that re-walked the array
 every 30 seconds would be a denial of service on the thing it is watching.
