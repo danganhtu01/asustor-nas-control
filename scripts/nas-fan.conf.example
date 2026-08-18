@@ -18,6 +18,23 @@
 # air at all.
 #FAN_CURVE="50:60 60:120 70:200 78:255"
 
+# --- preset: maximum cooling -------------------------------------------------
+#
+# Full speed, always. Uncomment both lines if you do not care about noise and
+# want the lowest temperature this hardware will give you.
+#
+# Be clear about what that buys. Measured on this box:
+#     pwm 255 (100%, 2636 RPM)  ->  package 58 C
+#     pwm 114  (44%, 1486 RPM)  ->  package 57 C
+# At idle the fan is worth about a degree, because the CPU is heatsink-limited
+# and not airflow-limited: it sits ~30 C above ambient whatever the fan does.
+# UNDER LOAD it is worth a great deal -- 58 C at full against 79 C at 20% -- so
+# this preset is really about holding the ceiling down when the box is busy,
+# not about lowering the idle floor.
+#
+#FAN_CURVE="30:255 90:255"
+#FAN_HYSTERESIS=0
+
 # At or above this, full speed regardless of the curve.
 #FAN_CRIT_TEMP=85
 

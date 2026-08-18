@@ -68,6 +68,41 @@ to have fallen `FAN_HYSTERESIS` degrees (4) below the *peak* seen since the
 level was last changed. Without this the fan audibly oscillates around every
 curve point, which is the most common complaint about fan daemons.
 
+## What temperature is actually achievable
+
+The floor is not set by the fan. This is a 10 W Celeron N5105 on a passive
+heatsink in a NAS chassis, and it sits roughly **30 °C above ambient** at idle
+no matter how hard the fan is driven:
+
+| fan | package |
+| --- | --- |
+| pwm 255 — 100 %, 2636 RPM | 58 °C |
+| pwm 114 — 44 %, 1486 RPM | 57 °C |
+| pwm 51 — 20 %, 768 RPM, *under load* | 79 °C |
+
+With ambient (`acpitz`) at 27 °C, the realistic idle floor is **55–58 °C**, and
+doubling the fan speed buys about one degree. The heat is not sitting in the
+chassis air waiting to be moved; it is stuck in the path from die to fin.
+
+So a *setpoint* controller — "hold 32 °C" — would be an honest feature to add
+but a pointless one here: every setpoint below the floor saturates the output at
+100 % and degenerates into a fixed maximum, with a PID loop's worth of
+machinery to arrive at the same place `FAN_CURVE="30:255 90:255"` reaches
+directly.
+
+Where fan speed genuinely matters is the **ceiling under load**: 58 °C at full
+against 79 °C at 20 % is the difference the daemon exists to make. Choose the
+curve for what it does when the box is busy, not for what it does at idle.
+
+To see your own floor rather than trusting this table:
+
+```bash
+sudo systemctl stop nas-fand     # the fail-safe puts the fan to 100%
+sleep 180
+sensors 2>/dev/null | grep -i package ||   echo "$(( $(cat /sys/class/hwmon/hwmon6/temp1_input) / 1000 )) C"
+sudo systemctl start nas-fand
+```
+
 ## The refresh timer
 
 `lcd-banner.service` writes the panel during the boot. `lcd-banner-refresh.timer`
