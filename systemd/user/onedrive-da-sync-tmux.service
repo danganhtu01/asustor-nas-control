@@ -1,0 +1,17 @@
+[Unit]
+Description=Keep the Dang & Associates tenant sync running in tmux
+After=default.target
+
+[Service]
+Type=simple
+Environment=TERM=screen-256color
+# Config and credential live under the service user: this is a user unit, so a
+# root-owned 0400 secret in /etc would simply be unreadable.
+Environment=M365_CONF=%h/.config/m365-backup/m365-backup.conf
+Environment=M365_STATE=%h/.local/state/m365-backup
+ExecStart=%h/bin/rclone-onedrive-da-sync-loop.sh --service
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

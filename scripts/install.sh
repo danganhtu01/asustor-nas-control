@@ -75,6 +75,27 @@ EOF
   systemctl daemon-reload 2>/dev/null || true
 fi
 
+# The tenant sync loop is a USER-level job, matching the existing OneDrive-Personal
+# and GoogleDrive-Personal loops: it runs as the owner inside tmux under a user
+# systemd unit, not as root. So it installs into that user's home, not /usr/local.
+target_user=${SUDO_USER:-}
+if [[ -n $target_user ]]; then
+  target_home=$(getent passwd "$target_user" | cut -d: -f6)
+  if [[ -n $target_home && -d $target_home ]]; then
+    install -o "$target_user" -g "$target_user" -Dm755 \
+      scripts/rclone-onedrive-da-sync-loop.sh \
+      "$target_home/bin/rclone-onedrive-da-sync-loop.sh"
+    install -o "$target_user" -g "$target_user" -Dm644 \
+      systemd/user/onedrive-da-sync-tmux.service \
+      "$target_home/.config/systemd/user/onedrive-da-sync-tmux.service"
+    install -d -o "$target_user" -g "$target_user" -m 0700 "$target_home/.config/m365-backup"
+    printf '  %s/bin/rclone-onedrive-da-sync-loop.sh\n' "$target_home"
+    printf '  %s/.config/systemd/user/onedrive-da-sync-tmux.service\n' "$target_home"
+  fi
+else
+  printf '  (SUDO_USER unset -- skipped the user-level tenant sync loop)\n'
+fi
+
 printf '\nMicrosoft 365 mirror (read docs/m365-backup.md first):\n'
 if [[ ${seeded_conf:-0} -eq 1 ]]; then
   printf '  1. edit /etc/m365-backup/m365-backup.conf   # seeded from the example\n'
@@ -86,3 +107,9 @@ printf '  3. m365-backup-preflight                    # read-only, safe to run b
 printf '  4. m365-backup-inventory\n'
 printf '  5. m365-backup-sync --dry-run\n'
 printf '  6. systemctl daemon-reload && systemctl enable --now m365-backup.timer\n'
+
+printf '\nDang & Associates tenant sync (user-level, matches the Personal loops):\n'
+printf '  1. put tenant + client id in ~/.config/m365-backup/m365-backup.conf\n'
+printf '  2. printf %%s SECRET > ~/.config/m365-backup/client_secret && chmod 600 it\n'
+printf '  3. rclone-onedrive-da-sync-loop.sh --once      # one cycle, in the foreground\n'
+printf '  4. systemctl --user enable --now onedrive-da-sync-tmux.service\n'

@@ -167,6 +167,40 @@ restart the sync loops:
 grep -rn '/run/media' ~ /etc/systemd 2>/dev/null
 ```
 
+## Two ways to run it
+
+**A. System-level, on its own timer** — `m365-backup.timer` fires
+`m365-backup-inventory` then `m365-backup-sync` as root, writing to
+`$M365_DEST_ROOT` with `--backup-dir` keeping replaced files. Self-contained; use
+this where nothing else provides history.
+
+**B. User-level loop, matching the existing Personal syncs** —
+`rclone-onedrive-da-sync-loop.sh` runs as the owner inside the same `rclone-sync`
+tmux session as the OneDrive-Personal and GoogleDrive-Personal loops, under
+`onedrive-da-sync-tmux.service`. This is what the ASUSTOR box uses.
+
+On that box, B is the right shape for two reasons:
+
+- **Discovery has to repeat.** A personal remote is one fixed tree, so its loop
+  syncs one path forever. A tenant is a moving set — people join, Teams create
+  sites, libraries appear. The loop re-enumerates from Graph at the top of every
+  cycle, so a new joiner is picked up on the next pass with nobody editing a list,
+  and a departed user's drive drops out of the sweep.
+- **History already exists one layer up.** The nightly NAS_03 → NAS_02 job
+  snapshots the whole of NAS_03, so `OneDrive-DA` is carried into those snapshots
+  for free. A second archive inside NAS_03 would only be snapshotted along with
+  everything else, so the loop keeps none and sets `M365_CURRENT_SUBDIR=` empty —
+  files land directly at `OneDrive-DA/onedrive/<upn>/`.
+
+The credential sits in `~/.config/m365-backup/` at mode 0600, not `/etc` at 0400
+root: a user unit cannot read a root-owned secret.
+
+```bash
+rclone-onedrive-da-sync-loop.sh --once     # one cycle in the foreground
+systemctl --user enable --now onedrive-da-sync-tmux.service
+tmux attach -t rclone-sync                 # watch it alongside the other loops
+```
+
 ## Layout on disk
 
 ```

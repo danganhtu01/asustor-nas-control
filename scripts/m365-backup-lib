@@ -61,6 +61,12 @@ m365_load_conf() {
   # be a real mountpoint; the subdirectory is ours to create.
   M365_VOLUME_ROOT="${M365_VOLUME_ROOT:-${NAS_MOUNT_BASE}/${NAS_M365_VOLUME}}"
 
+  # Live tree sits under this subdirectory so that --backup-dir can hold replaced
+  # files beside it. Set it empty when something else already provides history --
+  # on this NAS the nightly NAS_03 -> NAS_02 snapshot does, so a second archive
+  # layer inside NAS_03 would only be snapshotted along with everything else.
+  M365_CURRENT_SUBDIR="${M365_CURRENT_SUBDIR-current}"
+
   local mode
   mode=$(stat -c '%a' "$M365_SECRET_FILE")
   if [[ $mode != 400 && $mode != 600 ]]; then

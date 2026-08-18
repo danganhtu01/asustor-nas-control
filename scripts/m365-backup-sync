@@ -146,7 +146,7 @@ while IFS=$'\t' read -r k dest did dtype owner label wurl; do
   [[ -z $only || $dest =~ $only ]] || continue
 
   total=$(( total + 1 ))
-  target="$M365_DEST_ROOT/current/$dest"
+  target="$M365_DEST_ROOT${M365_CURRENT_SUBDIR:+/$M365_CURRENT_SUBDIR}/$dest"
   log="$logdir/$(m365_slug "$dest").log"
   install -d -m 0750 -- "$target"
 
