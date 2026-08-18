@@ -243,6 +243,40 @@ Do **not** drive the panel's power with `gpioset` on IT87 line 59. That line
 *is* `power:lcd` and is already claimed by `leds-gpio`, so it returns `EBUSY`,
 and `/dev/gpiochip*` are `0600 root:root` besides.
 
+## Front-panel LEDs
+
+`green:status` can read `brightness=1`, `trigger=[none]` — solid on, as far as
+Linux is concerned — and still visibly blink. Nothing in `/sys/class/leds` shows
+why, because the blinking is not the LED subsystem's doing:
+
+```console
+$ nas-leds --show
+blink masks:
+  gpled1_blink         47          # bitmask of GPIO LEDs the IT8625 blinks
+  gpled1_blink_freq    1 (0.5s OFF 0.5s ON)
+leds:
+  green:status           brightness=1    trigger=none
+```
+
+The IT8625 blinks those LEDs in hardware from its own GPIO register, over the
+top of whatever brightness the kernel has set. Clearing the mask hands each LED
+back to its brightness value, which is what makes "on" mean on:
+
+```bash
+nas-leds --show     # what the panel is doing now
+nas-leds --check    # what would be written
+```
+
+`nas-leds.service` applies the policy at boot — both controls are volatile.
+Defaults are `LED_BLINK1=0`, `LED_BLINK2=0`, and
+`LED_ON="green:status blue:power power:front_panel power:lcd"`. The factory
+value of group 1 on this box is **47**; set `LED_BLINK1=47` in
+`/etc/nas-leds/nas-leds.conf` to put the blinking back.
+
+LEDs driven by a trigger are left alone unless named: `sata*:green:disk` use
+`disk-activity` and `red:status` uses `panic`, and forcing those on would fight
+the trigger.
+
 ## Recovery
 
 ```bash

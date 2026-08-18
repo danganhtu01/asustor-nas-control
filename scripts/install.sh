@@ -22,6 +22,7 @@ install -Dm755 scripts/nas-status /usr/local/bin/nas-status
 install -Dm755 scripts/nas-fand /usr/local/bin/nas-fand
 install -Dm755 scripts/lcdline /usr/local/bin/lcdline
 install -Dm755 scripts/nas-lcd-banner /usr/local/bin/nas-lcd-banner
+install -Dm755 scripts/nas-leds /usr/local/bin/nas-leds
 install -Dm755 scripts/m365-backup-lib /usr/local/bin/m365-backup-lib
 install -Dm755 scripts/m365-backup-preflight /usr/local/bin/m365-backup-preflight
 install -Dm755 scripts/m365-backup-inventory /usr/local/bin/m365-backup-inventory
@@ -53,6 +54,7 @@ printf '  /usr/local/bin/nas-status\n'
 printf '  /usr/local/bin/nas-fand\n'
 printf '  /usr/local/bin/lcdline\n'
 printf '  /usr/local/bin/nas-lcd-banner\n'
+printf '  /usr/local/bin/nas-leds\n'
 printf '  /usr/local/bin/m365-backup-lib\n'
 printf '  /usr/local/bin/m365-backup-preflight\n'
 printf '  /usr/local/bin/m365-backup-inventory\n'
@@ -128,9 +130,10 @@ install -Dm644 systemd/nas-fand.service /etc/systemd/system/nas-fand.service
 install -Dm644 systemd/lcd-banner.service /etc/systemd/system/lcd-banner.service
 install -Dm644 systemd/lcd-banner-refresh.service /etc/systemd/system/lcd-banner-refresh.service
 install -Dm644 systemd/lcd-banner-refresh.timer /etc/systemd/system/lcd-banner-refresh.timer
+install -Dm644 systemd/nas-leds.service /etc/systemd/system/nas-leds.service
 install -Dm644 systemd/udev/99-asustor-lcm.rules /etc/udev/rules.d/99-asustor-lcm.rules
 
-for conf_pair in "nas-fan:nas-fan.conf" "nas-lcd:nas-lcd.conf"; do
+for conf_pair in "nas-fan:nas-fan.conf" "nas-lcd:nas-lcd.conf" "nas-leds:nas-leds.conf"; do
   conf_dir=/etc/${conf_pair%%:*}
   conf_file=$conf_dir/${conf_pair##*:}
   if [[ ! -e $conf_file ]]; then
@@ -196,15 +199,25 @@ udevadm trigger --subsystem-match=tty --action=add 2>/dev/null || true
 if [[ -e /dev/asustor-lcm || -e /dev/ttyS1 ]]; then
   if systemctl enable --now lcd-banner.service 2>/dev/null; then
     systemctl try-restart lcd-banner.service 2>/dev/null || true
-    systemctl enable --now lcd-banner-refresh.timer 2>/dev/null || true
     printf '  lcd-banner.service enabled and started\n'
-    printf '  lcd-banner-refresh.timer enabled (re-reads the boot state 90s after boot)\n'
   else
     printf '  could not start lcd-banner.service -- systemctl status lcd-banner\n'
   fi
+  # Independent of the above: the later re-read matters most precisely when the
+  # first write did not go well.
+  systemctl enable --now lcd-banner-refresh.timer 2>/dev/null || true
+  printf '  lcd-banner-refresh.timer enabled (re-reads the boot state 90s after boot)\n'
   /usr/local/bin/nas-lcd-banner --check 2>/dev/null | sed -n '1,4p' | sed 's/^/  /' || true
 else
   printf '  no LCD serial port present; skipped\n'
+fi
+
+printf '\nFront-panel LEDs:\n'
+if systemctl enable --now nas-leds.service 2>/dev/null; then
+  systemctl try-restart nas-leds.service 2>/dev/null || true
+  printf '  nas-leds.service enabled; hardware blink cleared, status LED solid\n'
+else
+  printf '  could not start nas-leds.service -- systemctl status nas-leds\n'
 fi
 
 printf '\nMicrosoft 365 mirror (read docs/m365-backup.md first):\n'

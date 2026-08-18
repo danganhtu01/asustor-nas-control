@@ -112,6 +112,14 @@ stty -F "$PORT" 115200 raw -echo -echoe -echok -crtscts min 0 time 1 2>/dev/null
 dd if="$PORT" of=/dev/null bs=256 count=4 iflag=nonblock 2>/dev/null || true
 
 for (( n = 0; n < RETRY; n++ )); do
+  # Sleep BEFORE the repeat, not after the last one. As a trailing statement
+  # `(( n + 1 < RETRY )) && sleep` is false on the final pass, and since the
+  # loop is the last thing in the script that false became the script's exit
+  # status -- so a write that fully succeeded reported failure, and
+  # lcd-banner.service was marked failed on every boot.
+  (( n > 0 )) && sleep 0.05
   emit > "$PORT"
-  (( n + 1 < RETRY )) && sleep 0.05
 done
+
+# Never let the loop's arithmetic decide what this script returns.
+exit 0

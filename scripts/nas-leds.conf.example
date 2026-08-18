@@ -1,0 +1,24 @@
+# /etc/nas-leds/nas-leds.conf
+# Sourced by nas-leds. Shell syntax.
+#
+# Preview without writing anything:
+#     nas-leds --show      # what the panel is doing now
+#     nas-leds --check     # what would be written
+#     systemctl restart nas-leds
+
+# IT8625 GPIO hardware blink masks. This is the control that actually makes a
+# front LED blink -- NOT the LED trigger. green:status can read brightness=1
+# with trigger [none], which looks solid from /sys/class/leds, and still blink
+# because the chip is blinking it from here.
+#
+# 0 disables hardware blinking for the group, so each LED simply follows its own
+# brightness. The factory value of group 1 on this box is 47; set LED_BLINK1=47
+# to put the blinking back.
+#LED_BLINK1=0
+#LED_BLINK2=0
+
+# LEDs to force on and off, by name under /sys/class/leds. An LED driven by a
+# trigger -- the sata*:green:disk ones use disk-activity, red:status uses panic
+# -- is left alone unless you name it here, which would fight its trigger.
+#LED_ON="green:status blue:power power:front_panel power:lcd"
+#LED_OFF=""

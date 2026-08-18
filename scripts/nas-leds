@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+#
+# nas-leds -- apply a standing LED policy to ASUSTOR NAS front-panel LEDs.
+#
+# WHY THIS IS NOT JUST `echo 1 > brightness`
+#
+# The front LEDs have two independent controls, and only one of them is the LED
+# subsystem. `green:status` can read brightness=1, trigger=[none] -- solid on,
+# as far as Linux is concerned -- and still visibly blink, because the IT8625
+# blinks it in hardware from its own GPIO blink register:
+#
+#   gpled1_blink       47          bitmask of GPIO LEDs the chip blinks
+#   gpled1_blink_freq  1           0.5s off / 0.5s on
+#
+# Nothing in /sys/class/leds shows that. Clearing the blink mask hands the LED
+# back to its brightness value, which is what makes "on" mean on.
+#
+# Both settings are volatile, so this runs at boot from nas-leds.service.
+
+set -uo pipefail
+
+CONF="${NAS_LEDS_CONF:-/etc/nas-leds/nas-leds.conf}"
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && . "$CONF"
+
+# The IT8625 hardware blink masks. 0 means "do not blink anything in hardware";
+# each LED then simply follows its own brightness. On this box the factory value
+# of group 1 is 47 -- set LED_BLINK1=47 to put the blinking back.
+LED_BLINK1="${LED_BLINK1-0}"
+LED_BLINK2="${LED_BLINK2-0}"
+
+# LEDs to force on and off, by name under /sys/class/leds. An LED driven by a
+# trigger (disk-activity, panic) is left alone unless named here.
+LED_ON="${LED_ON-green:status blue:power power:front_panel power:lcd}"
+LED_OFF="${LED_OFF-}"
+
+usage() {
+  cat <<'USAGE'
+Usage: nas-leds [--check] [--show] [--help]
+
+Apply the standing LED policy: clear the IT8625 hardware blink masks so "on"
+means solid, and force the named LEDs on or off.
+
+  --show    Print the current LED and blink state and exit. Needs no root.
+  --check   Print what would be written, writing nothing. Needs no root.
+
+Configuration: /etc/nas-leds/nas-leds.conf
+  LED_BLINK1  IT8625 GPIO blink mask, group 1 (default 0 = no hardware blink)
+  LED_BLINK2  the same for group 2
+  LED_ON      space-separated LED names to switch on
+  LED_OFF     space-separated LED names to switch off
+USAGE
+}
+
+opt_check=0 opt_show=0
+while (($#)); do
+  case "$1" in
+    --check) opt_check=1 ;;
+    --show)  opt_show=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf 'nas-leds: unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# By chip name, not hwmon index: the numbering is probe-order and not stable.
+it87_hwmon() {
+  local h name
+  for h in /sys/devices/platform/asustor_it87.*/hwmon/hwmon* /sys/class/hwmon/hwmon*; do
+    [[ -d $h ]] || continue
+    name=$(cat "$h/name" 2>/dev/null) || continue
+    case "$name" in it8625|it87|asustor_it87|asustor-it87) printf '%s\n' "$h"; return 0 ;; esac
+  done
+  return 1
+}
+
+HW=$(it87_hwmon) || HW=''
+
+if ((opt_show)); then
+  printf 'blink masks:\n'
+  if [[ -n $HW ]]; then
+    for f in "$HW"/gpled*; do
+      [[ -e $f ]] && printf '  %-20s %s\n' "$(basename "$f")" "$(cat "$f" 2>/dev/null)"
+    done
+  else
+    printf '  (no IT87 controller found)\n'
+  fi
+  printf 'leds:\n'
+  for l in /sys/class/leds/*/; do
+    [[ -e $l/brightness ]] || continue
+    printf '  %-22s brightness=%-4s trigger=%s\n' "$(basename "$l")" \
+      "$(cat "$l/brightness" 2>/dev/null)" \
+      "$(sed -n 's/.*\[\([^]]*\)\].*/\1/p' "$l/trigger" 2>/dev/null)"
+  done
+  exit 0
+fi
+
+write() {   # value path -- reports whether it landed, and never spews on EACCES
+  local value=$1 path=$2
+  [[ -e $path ]] || return 1
+  if ((opt_check)); then
+    printf '  would write %-4s -> %s\n' "$value" "$path"
+    return 0
+  fi
+  ( printf '%s\n' "$value" >"$path" ) 2>/dev/null || return 1
+  return 0
+}
+
+rc=0
+
+if [[ -n $HW ]]; then
+  for pair in "1:$LED_BLINK1" "2:$LED_BLINK2"; do
+    group=${pair%%:*}; value=${pair#*:}
+    [[ -n $value ]] || continue
+    [[ $value =~ ^[0-9]+$ ]] || { printf 'nas-leds: LED_BLINK%s must be a number\n' "$group" >&2; rc=1; continue; }
+    target="$HW/gpled${group}_blink"
+    [[ -e $target ]] || continue
+    if ! write "$value" "$target"; then
+      printf 'nas-leds: could not write %s (needs root)\n' "$target" >&2
+      rc=1
+    fi
+  done
+else
+  printf 'nas-leds: no IT87 controller found; blink masks not touched\n' >&2
+fi
+
+for spec in "1:$LED_ON" "0:$LED_OFF"; do
+  value=${spec%%:*}; names=${spec#*:}
+  for led in $names; do
+    path="/sys/class/leds/$led/brightness"
+    if [[ ! -e $path ]]; then
+      printf 'nas-leds: no such LED: %s\n' "$led" >&2
+      rc=1
+      continue
+    fi
+    if ! write "$value" "$path"; then
+      printf 'nas-leds: could not write %s (needs root)\n' "$path" >&2
+      rc=1
+    fi
+  done
+done
+
+exit "$rc"

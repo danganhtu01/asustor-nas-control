@@ -1,0 +1,26 @@
+[Unit]
+Description=ASUSTOR front-panel LED policy
+Documentation=file:///usr/local/share/doc/asustor-nas-control/thermal-and-lcd.md
+After=multi-user.target
+ConditionPathExistsGlob=/sys/devices/platform/asustor_it87.*
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/nas-leds
+
+# Writes /sys, so ProtectKernelTunables and ProtectSystem=strict are both out --
+# they would make the files this unit exists to write read-only.
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

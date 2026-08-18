@@ -265,6 +265,17 @@ nas-lcd-banner --check          # what would be written, touching no hardware
 lcdline --dry-run 0 ArchNAS     # the raw frame, checksum and all
 ```
 
+**LEDs.** A front LED can read `brightness=1`, `trigger=[none]` and still
+blink: the IT8625 blinks it in hardware from its own GPIO register, over the top
+of whatever the kernel set, and nothing in `/sys/class/leds` shows that.
+`nas-leds` clears the blink mask so "on" means solid, and `nas-leds.service`
+re-applies it at boot because both controls are volatile.
+
+```bash
+nas-leds --show     # blink masks and every LED's real state
+nas-leds --check    # what would be written
+```
+
 Full details, protocol, tuning and recovery:
 [`docs/thermal-and-lcd.md`](docs/thermal-and-lcd.md).
 
