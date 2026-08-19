@@ -427,6 +427,16 @@ fill it.
 Full setup, limitations and restore procedure: [`docs/m365-backup.md`](docs/m365-backup.md).
 
 
+## Documentation
+
+| doc | what is in it |
+| --- | --- |
+| [`docs/as6704-observed-state.md`](docs/as6704-observed-state.md) | ground truth for this hardware: fan, sensors, LEDs, LCD port, storage — all measured, none of it from a datasheet |
+| [`docs/thermal-and-lcd.md`](docs/thermal-and-lcd.md) | fan curve, LED blink register, LCD protocol, tuning and recovery |
+| [`docs/nas-status.md`](docs/nas-status.md) | the health command: columns, exit codes, job registry format |
+| [`docs/m365-backup.md`](docs/m365-backup.md) | the Microsoft 365 tenant mirror |
+| [`docs/outstanding.md`](docs/outstanding.md) | known open items, and what it would take to close each |
+
 ## Notes
 
 - `fanspeed 200` means raw PWM value `200`, on a `0..255` scale.
